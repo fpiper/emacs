@@ -1,0 +1,1970 @@
+#+begin_src emacs-lisp
+;;; gnus-icalendar.el --- reply to iCalendar meeting requests  -*- lexical-binding:t -*-
+
+;; Copyright (C) 2013-2020 Free Software Foundation, Inc.
+
+;; Author: Jan Tatarik <Jan.Tatarik@gmail.com>
+;; Keywords: mail, icalendar, org
+
+;; This program is free software; you can redistribute it and/or modify
+;; it under the terms of the GNU General Public License as published by
+;; the Free Software Foundation, either version 3 of the License, or
+;; (at your option) any later version.
+
+;; This program is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;; GNU General Public License for more details.
+
+;; You should have received a copy of the GNU General Public License
+;; along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+;;; Commentary:
+
+;; To install:
+;; (require 'gnus-icalendar)
+;; (gnus-icalendar-setup)
+
+;; to enable optional iCalendar->Org sync functionality
+;; NOTE: both the capture file and the headline(s) inside must already exist
+;; (setq gnus-icalendar-org-capture-file "~/org/notes.org")
+;; (setq gnus-icalendar-org-capture-headline '("Calendar"))
+;; (gnus-icalendar-org-setup)
+
+
+;;; Code:
+
+(require 'icalendar)
+(require 'eieio)
+(require 'gmm-utils)
+(require 'mm-decode)
+(require 'gnus-sum)
+(require 'gnus-art)
+
+(eval-when-compile (require 'cl-lib))
+
+(defun gnus-icalendar-find-if (pred seq)
+  (catch 'found
+    (while seq
+      (when (funcall pred (car seq))
+        (throw 'found (car seq)))
+      (pop seq))))
+
+;;;
+;;; ical-event
+;;;
+
+(defclass gnus-icalendar-event ()
+  ((organizer :initarg :organizer
+              :accessor gnus-icalendar-event:organizer
+              :initform ""
+              :type (or null string))
+   (summary :initarg :summary
+            :accessor gnus-icalendar-event:summary
+            :initform ""
+            :type (or null string))
+   (description :initarg :description
+                :accessor gnus-icalendar-event:description
+                :initform ""
+                :type (or null string))
+   (location :initarg :location
+             :accessor gnus-icalendar-event:location
+             :initform ""
+             :type (or null string))
+   (start-time :initarg :start-time
+          :accessor gnus-icalendar-event:start-time
+          :initform ""
+          :type (or null t))
+   (end-time :initarg :end-time
+        :accessor gnus-icalendar-event:end-time
+        :initform ""
+        :type (or null t))
+   (recur :initarg :recur
+          :accessor gnus-icalendar-event:recur
+          :initform ""
+          :type (or null string))
+   (uid :initarg :uid
+        :accessor gnus-icalendar-event:uid
+        :type string)
+   (method :initarg :method
+           :accessor gnus-icalendar-event:method
+           :initform "PUBLISH"
+           :type (or null string))
+   (rsvp :initarg :rsvp
+         :accessor gnus-icalendar-event:rsvp
+         :initform nil
+         :type (or null boolean))
+   (participation-type :initarg :participation-type
+         :accessor gnus-icalendar-event:participation-type
+         :initform 'non-participant
+         :type (or null t))
+   (req-participants :initarg :req-participants
+         :accessor gnus-icalendar-event:req-participants
+         :initform nil
+         :type (or null t))
+   (opt-participants :initarg :opt-participants
+         :accessor gnus-icalendar-event:opt-participants
+         :initform nil
+         :type (or null t)))
+  "generic iCalendar Event class")
+
+(defclass gnus-icalendar-event-request (gnus-icalendar-event)
+  nil
+  "iCalendar class for REQUEST events")
+
+(defclass gnus-icalendar-event-cancel (gnus-icalendar-event)
+  nil
+  "iCalendar class for CANCEL events")
+
+(defclass gnus-icalendar-event-reply (gnus-icalendar-event)
+  nil
+  "iCalendar class for REPLY events")
+
+(cl-defmethod gnus-icalendar-event:recurring-p ((event gnus-icalendar-event))
+  "Return t if EVENT is recurring."
+  (not (null (gnus-icalendar-event:recur event))))
+
+(cl-defmethod gnus-icalendar-event:recurring-freq ((event gnus-icalendar-event))
+  "Return recurring frequency of EVENT."
+  (let ((rrule (gnus-icalendar-event:recur event)))
+    (string-match "FREQ=\\([[:alpha:]]+\\)" rrule)
+    (match-string 1 rrule)))
+
+(cl-defmethod gnus-icalendar-event:recurring-interval ((event gnus-icalendar-event))
+  "Return recurring interval of EVENT."
+  (let ((rrule (gnus-icalendar-event:recur event))
+        (default-interval 1))
+
+    (string-match "INTERVAL=\\([[:digit:]]+\\)" rrule)
+    (or (match-string 1 rrule)
+        default-interval)))
+
+(cl-defmethod gnus-icalendar-event:start ((event gnus-icalendar-event))
+  (format-time-string "%Y-%m-%d %H:%M" (gnus-icalendar-event:start-time event)))
+
+(defun gnus-icalendar-event--decode-datefield (event field zone-map)
+  (let* ((dtdate (icalendar--get-event-property event field))
+         (dtdate-zone (icalendar--find-time-zone
+                       (icalendar--get-event-property-attributes
+                        event field) zone-map))
+         (dtdate-dec (icalendar--decode-isodatetime dtdate nil dtdate-zone)))
+    (encode-time dtdate-dec)))
+
+(defun gnus-icalendar-event--find-attendee (ical name-or-email)
+  (let* ((event (car (icalendar--all-events ical)))
+         (event-props (caddr event)))
+    (cl-labels ((attendee-name (att) (plist-get (cadr att) 'CN))
+                (attendee-email
+                 (att)
+                 (replace-regexp-in-string "^.*MAILTO:" "" (caddr att)))
+                (attendee-prop-matches-p
+                 (prop)
+                 (and (eq (car prop) 'ATTENDEE)
+                      (or (member (attendee-name prop) name-or-email)
+                          (let ((att-email (attendee-email prop)))
+                            (gnus-icalendar-find-if
+                             (lambda (email)
+                               (string-match email att-email))
+                             name-or-email))))))
+      (gnus-icalendar-find-if #'attendee-prop-matches-p event-props))))
+
+(defun gnus-icalendar-event--get-attendee-names (ical)
+  (let* ((event (car (icalendar--all-events ical)))
+         (attendee-props (seq-filter
+                          (lambda (p) (eq (car p) 'ATTENDEE))
+                          (caddr event))))
+
+    (cl-labels
+        ((attendee-role (prop) (plist-get (cadr prop) 'ROLE))
+         (attendee-name
+          (prop)
+          (or (plist-get (cadr prop) 'CN)
+              (replace-regexp-in-string "^.*MAILTO:" "" (caddr prop))))
+         (attendees-by-type (type)
+                            (seq-filter
+                             (lambda (p) (string= (attendee-role p) type))
+                             attendee-props))
+         (attendee-names-by-type
+          (type)
+          (mapcar #'attendee-name (attendees-by-type type))))
+      (list
+       (attendee-names-by-type "REQ-PARTICIPANT")
+       (attendee-names-by-type "OPT-PARTICIPANT")))))
+
+(defun gnus-icalendar-event-from-ical (ical &optional attendee-name-or-email)
+  (let* ((event (car (icalendar--all-events ical)))
+         (organizer (replace-regexp-in-string
+                     "^.*MAILTO:" ""
+                     (or (icalendar--get-event-property event 'ORGANIZER) "")))
+         (prop-map '((summary . SUMMARY)
+                     (description . DESCRIPTION)
+                     (location . LOCATION)
+                     (recur . RRULE)
+                     (uid . UID)))
+         (method (caddr (assoc 'METHOD (caddr (car (nreverse ical))))))
+         (attendee (when attendee-name-or-email
+                     (gnus-icalendar-event--find-attendee ical attendee-name-or-email)))
+         (attendee-names (gnus-icalendar-event--get-attendee-names ical))
+         (role (plist-get (cadr attendee) 'ROLE))
+         (participation-type (pcase role
+                              ("REQ-PARTICIPANT" 'required)
+                              ("OPT-PARTICIPANT" 'optional)
+                              (_                 'non-participant)))
+         (zone-map (icalendar--convert-all-timezones ical))
+         (args (list :method method
+                     :organizer organizer
+                     :start-time (gnus-icalendar-event--decode-datefield event 'DTSTART zone-map)
+                     :end-time (gnus-icalendar-event--decode-datefield event 'DTEND zone-map)
+                     :rsvp (string= (plist-get (cadr attendee) 'RSVP) "TRUE")
+                     :participation-type participation-type
+                     :req-participants (car attendee-names)
+                     :opt-participants (cadr attendee-names)))
+         (event-class (cond
+                       ((string= method "REQUEST") 'gnus-icalendar-event-request)
+                       ((string= method "CANCEL") 'gnus-icalendar-event-cancel)
+                       ((string= method "REPLY") 'gnus-icalendar-event-reply)
+                       (t 'gnus-icalendar-event))))
+
+    (cl-labels
+        ((map-property
+          (prop)
+          (let ((value (icalendar--get-event-property event prop)))
+            (when value
+              ;; ugly, but cannot get
+              ;;replace-regexp-in-string work with "\\" as
+              ;;REP, plus we should also handle "\\;"
+              (replace-regexp-in-string
+               "\\\\," ","
+               (replace-regexp-in-string
+                "\\\\n" "\n" (substring-no-properties value))))))
+         (accumulate-args
+          (mapping)
+          (cl-destructuring-bind (slot . ical-property) mapping
+            (setq args (append (list
+                                (intern (concat ":" (symbol-name slot)))
+                                (map-property ical-property))
+                               args)))))
+      (mapc #'accumulate-args prop-map)
+      (apply #'make-instance event-class args))))
+
+(defun gnus-icalendar-event-from-buffer (buf &optional attendee-name-or-email)
+  "Parse RFC5545 iCalendar in buffer BUF and return an event object.
+
+Return a gnus-icalendar-event object representing the first event
+contained in the invitation.  Return nil for calendars without an
+event entry.
+
+ATTENDEE-NAME-OR-EMAIL is a list of strings that will be matched
+against the event's attendee names and emails.  Invitation rsvp
+status will be retrieved from the first matching attendee record."
+  (let ((ical (with-current-buffer (icalendar--get-unfolded-buffer (get-buffer buf))
+                (goto-char (point-min))
+                (icalendar--read-element nil nil))))
+
+    (when ical
+      (gnus-icalendar-event-from-ical ical attendee-name-or-email))))
+
+;;;
+;;; gnus-icalendar-event-reply
+;;;
+
+(defun gnus-icalendar-event--build-reply-event-body (ical-request status identities)
+  (let ((summary-status (capitalize (symbol-name status)))
+        (attendee-status (upcase (symbol-name status)))
+        reply-event-lines)
+    (cl-labels
+        ((update-summary
+          (line)
+          (if (string-match "^[^:]+:" line)
+              (replace-match (format "\\&%s: " summary-status) t nil line)
+            line))
+         (update-dtstamp ()
+                         (format-time-string "DTSTAMP:%Y%m%dT%H%M%SZ" nil t))
+         (attendee-matches-identity
+          (line)
+          (gnus-icalendar-find-if (lambda (name) (string-match-p name line))
+                                  identities))
+         (update-attendee-status
+          (line)
+          (when (and (attendee-matches-identity line)
+                     (string-match "\\(PARTSTAT=\\)[^;]+" line))
+            (replace-match (format "\\1%s" attendee-status) t nil line)))
+         (process-event-line
+          (line)
+          (when (string-match "^\\([^;:]+\\)" line)
+            (let* ((key (match-string 0 line))
+                   ;; NOTE: not all of the below fields are mandatory,
+                   ;; but they are often present in other clients'
+                   ;; replies. Can be helpful for debugging, too.
+                   (new-line
+                    (cond
+                     ((string= key "ATTENDEE") (update-attendee-status line))
+                     ((string= key "SUMMARY") (update-summary line))
+                     ((string= key "DTSTAMP") (update-dtstamp))
+                     ((member key '("ORGANIZER" "DTSTART" "DTEND"
+                                    "LOCATION" "DURATION" "SEQUENCE"
+                                    "RECURRENCE-ID" "UID"))
+                      line)
+                     (t nil))))
+              (when new-line
+                (push new-line reply-event-lines))))))
+
+      (mapc #'process-event-line (split-string ical-request "\n"))
+
+      (unless (gnus-icalendar-find-if (lambda (x) (string-match "^ATTENDEE" x))
+                                      reply-event-lines)
+        (error "Could not find an event attendee matching given identity"))
+
+      (mapconcat #'identity `("BEGIN:VEVENT"
+                              ,@(nreverse reply-event-lines)
+                              "END:VEVENT")
+                 "\n"))))
+
+(defun gnus-icalendar-event-reply-from-buffer (buf status identities)
+  "Build a calendar event reply for request contained in BUF.
+The reply will have STATUS (`accepted', `tentative' or  `declined').
+The reply will be composed for attendees matching any entry
+on the IDENTITIES list."
+  (cl-labels
+      ((extract-block
+        (blockname)
+        (save-excursion
+          (let ((block-start-re (format "^BEGIN:%s" blockname))
+                (block-end-re (format "^END:%s" blockname))
+                start)
+            (when (re-search-forward block-start-re nil t)
+              (setq start (line-beginning-position))
+              (re-search-forward block-end-re)
+              (buffer-substring-no-properties start (line-end-position)))))))
+    (let (zone event)
+      (with-current-buffer (icalendar--get-unfolded-buffer (get-buffer buf))
+        (goto-char (point-min))
+        (setq zone (extract-block "VTIMEZONE")
+              event (extract-block "VEVENT")))
+
+      (when event
+        (let ((contents (list "BEGIN:VCALENDAR"
+                              "METHOD:REPLY"
+                              "PRODID:Gnus"
+                              "VERSION:2.0"
+                              zone
+                              (gnus-icalendar-event--build-reply-event-body event status identities)
+                              "END:VCALENDAR")))
+
+          (mapconcat #'identity (delq nil contents) "\n"))))))
+
+;;;
+;;; gnus-icalendar-org
+;;
+;; TODO: this is an optional feature, and it's only available with org-mode
+;; 7+, so will need to properly handle emacsen with no/outdated org-mode
+
+(require 'org)
+(require 'org-capture)
+
+(defgroup gnus-icalendar-org nil
+  "Settings for Calendar Event gnus/org integration."
+  :version "24.4"
+  :group 'gnus-icalendar
+  :prefix "gnus-icalendar-org-")
+
+(defcustom gnus-icalendar-org-capture-file nil
+  "Target Org file for storing captured calendar events."
+  :type '(choice (const nil) file))
+
+(defcustom gnus-icalendar-org-capture-headline nil
+  "Target outline in `gnus-icalendar-org-capture-file' for storing captured events."
+  :type '(repeat string))
+
+(defcustom gnus-icalendar-org-template-name "used by gnus-icalendar-org"
+  "Org-mode template name."
+  :type '(string))
+
+(defcustom gnus-icalendar-org-template-key "#"
+  "Org-mode template hotkey."
+  :type '(string))
+
+(defvar gnus-icalendar-org-enabled-p nil)
+
+
+(cl-defmethod gnus-icalendar-event:org-repeat ((event gnus-icalendar-event))
+  "Return `org-mode' timestamp repeater string for recurring EVENT.
+Return nil for non-recurring EVENT."
+  (when (gnus-icalendar-event:recurring-p event)
+    (let* ((freq-map '(("HOURLY" . "h")
+                       ("DAILY" . "d")
+                       ("WEEKLY" . "w")
+                       ("MONTHLY" . "m")
+                       ("YEARLY" . "y")))
+           (org-freq (cdr (assoc (gnus-icalendar-event:recurring-freq event) freq-map))))
+
+      (when org-freq
+        (format "+%s%s" (gnus-icalendar-event:recurring-interval event) org-freq)))))
+
+(cl-defmethod gnus-icalendar-event:org-timestamp ((event gnus-icalendar-event))
+  "Build `org-mode' timestamp from EVENT start/end dates and recurrence info."
+  (let* ((start (gnus-icalendar-event:start-time event))
+         (end (gnus-icalendar-event:end-time event))
+         (start-date (format-time-string "%Y-%m-%d" start))
+         (start-time (format-time-string "%H:%M" start))
+         (start-at-midnight (string= start-time "00:00"))
+         (end-date (format-time-string "%Y-%m-%d" end))
+         (end-time (format-time-string "%H:%M" end))
+         (end-at-midnight (string= end-time "00:00"))
+         (start-end-date-diff
+          (time-to-number-of-days (time-subtract
+                                   (org-time-string-to-time end-date)
+                                   (org-time-string-to-time start-date))))
+         (org-repeat (gnus-icalendar-event:org-repeat event))
+         (repeat (if org-repeat (concat " " org-repeat) ""))
+         (time-1-day 86400))
+
+    ;; NOTE: special care is needed with appointments ending at midnight
+    ;; (typically all-day events): the end time has to be changed to 23:59 to
+    ;; prevent org agenda showing the event on one additional day
+    (cond
+     ;; start/end midnight
+     ;; A 0:0 - A+1 0:0 -> A
+     ;; A 0:0 - A+n 0:0 -> A - A+n-1
+     ((and start-at-midnight end-at-midnight) (if (> start-end-date-diff 1)
+                                                  (let ((end-ts (format-time-string "%Y-%m-%d" (time-subtract end time-1-day))))
+                                                    (format "<%s>--<%s>" start-date end-ts))
+                                                (format "<%s%s>" start-date repeat)))
+     ;; end midnight
+     ;; A .:. - A+1 0:0 -> A .:.-23:59
+     ;; A .:. - A+n 0:0 -> A .:. - A_n-1
+     (end-at-midnight (if (= start-end-date-diff 1)
+                          (format "<%s %s-23:59%s>" start-date start-time repeat)
+                        (let ((end-ts (format-time-string "%Y-%m-%d" (time-subtract end time-1-day))))
+                          (format "<%s %s>--<%s>" start-date start-time end-ts))))
+     ;; start midnight
+     ;; A 0:0 - A .:. -> A 0:0-.:. (default 1)
+     ;; A 0:0 - A+n .:. -> A - A+n .:.
+     ((and start-at-midnight
+           (cl-plusp start-end-date-diff)) (format "<%s>--<%s %s>" start-date end-date end-time))
+     ;; default
+     ;; A .:. - A .:. -> A .:.-.:.
+     ;; A .:. - B .:.
+     ((zerop start-end-date-diff) (format "<%s %s-%s%s>" start-date start-time end-time repeat))
+     (t (format "<%s %s>--<%s %s>" start-date start-time end-date end-time)))))
+
+(defun gnus-icalendar--format-summary-line (summary &optional location)
+  (if location
+      (format "%s (%s)" summary location)
+    (format "%s" summary)))
+
+
+(defun gnus-icalendar--format-participant-list (participants)
+  (mapconcat #'identity participants ", "))
+
+;; TODO: make the template customizable
+(cl-defmethod gnus-icalendar-event->org-entry ((event gnus-icalendar-event) reply-status)
+  "Return string with new `org-mode' entry describing EVENT."
+  (with-temp-buffer
+    (org-mode)
+    (with-slots (organizer summary description location
+                           recur uid) event
+      (let* ((reply (if reply-status (capitalize (symbol-name reply-status))
+                      "Not replied yet"))
+             (props `(("ICAL_EVENT" . "t")
+                      ("ID" . ,uid)
+                      ("ORGANIZER" . ,(gnus-icalendar-event:organizer event))
+                      ("LOCATION" . ,(gnus-icalendar-event:location event))
+                      ("PARTICIPATION_TYPE" . ,(symbol-name (gnus-icalendar-event:participation-type event)))
+                      ("REQ_PARTICIPANTS" . ,(gnus-icalendar--format-participant-list (gnus-icalendar-event:req-participants event)))
+                      ("OPT_PARTICIPANTS" . ,(gnus-icalendar--format-participant-list (gnus-icalendar-event:opt-participants event)))
+                      ("RRULE" . ,(gnus-icalendar-event:recur event))
+                      ("REPLY" . ,reply))))
+
+        (insert (format "* %s\n\n"
+                        (gnus-icalendar--format-summary-line summary location)))
+        (mapc (lambda (prop)
+                (org-entry-put (point) (car prop) (cdr prop)))
+              props))
+
+      (save-restriction
+        (narrow-to-region (point) (point))
+        (insert (gnus-icalendar-event:org-timestamp event)
+                "\n\n"
+                (or description "No description"))
+        (indent-region (point-min) (point-max) 2)
+        (fill-region (point-min) (point-max)))
+
+      (buffer-string))))
+
+(defun gnus-icalendar--deactivate-org-timestamp (ts)
+  (replace-regexp-in-string "[<>]"
+                            (lambda (m) (cond ((string= m "<") "[")
+                                              ((string= m ">") "]")))
+                            ts))
+
+(defun gnus-icalendar-find-org-event-file (event &optional org-file)
+  "Return the name of the file containing EVENT org entry.
+Return nil when not found.
+
+All org agenda files are searched for the EVENT entry.  When
+the optional ORG-FILE argument is specified, only that one file
+is searched."
+  (let ((uid (gnus-icalendar-event:uid event))
+        (files (or org-file (org-agenda-files t 'ifmode))))
+    (cl-labels
+        ((find-event-in
+          (file)
+          (org-check-agenda-file file)
+          (with-current-buffer (find-file-noselect file)
+            (let ((event-pos (org-find-entry-with-id uid)))
+              (when (and event-pos
+                         (string= (cdr (assoc "ICAL_EVENT"
+                                              (org-entry-properties event-pos)))
+                                  "t"))
+                (throw 'found file))))))
+      (gnus-icalendar-find-if #'find-event-in files))))
+
+
+(defun gnus-icalendar--show-org-event (event &optional org-file)
+  (let ((file (gnus-icalendar-find-org-event-file event org-file)))
+    (when file
+      (switch-to-buffer (find-file file))
+      (goto-char (org-find-entry-with-id (gnus-icalendar-event:uid event)))
+      (org-show-entry))))
+
+
+(defun gnus-icalendar--update-org-event (event reply-status &optional org-file)
+  (let ((file (gnus-icalendar-find-org-event-file event org-file)))
+    (when file
+      (with-current-buffer (find-file-noselect file)
+        (with-slots (uid summary description organizer location recur
+                         participation-type req-participants opt-participants) event
+          (let ((event-pos (org-find-entry-with-id uid)))
+            (when event-pos
+              (goto-char event-pos)
+
+              ;; update the headline, keep todo, priority and tags, if any
+              (save-excursion
+                (let* ((priority (org-entry-get (point) "PRIORITY"))
+                       (headline (delq nil (list
+                                            (org-entry-get (point) "TODO")
+                                            (when priority (format "[#%s]" priority))
+                                            (gnus-icalendar--format-summary-line summary location)
+                                            (org-entry-get (point) "TAGS")))))
+
+                  (re-search-forward "^\\*+ " (line-end-position))
+                  (delete-region (point) (line-end-position))
+                  (insert (mapconcat #'identity headline " "))))
+
+              ;; update props and description
+              (let ((entry-end (org-entry-end-position))
+                    (entry-outline-level (org-outline-level)))
+
+                ;; delete body of the entry, leave org drawers intact
+                (save-restriction
+                  (org-narrow-to-element)
+                  (goto-char entry-end)
+                  (re-search-backward "^[\t ]*:END:")
+                  (forward-line)
+                  (delete-region (point) entry-end))
+
+                ;; put new event description in the entry body
+                (when description
+                  (save-restriction
+                    (narrow-to-region (point) (point))
+                    (insert "\n"
+                            (gnus-icalendar-event:org-timestamp event)
+                            "\n\n"
+                            (replace-regexp-in-string "[\n]+$" "\n" description)
+                            "\n")
+                    (indent-region (point-min) (point-max) (1+ entry-outline-level))
+                    (fill-region (point-min) (point-max))))
+
+                ;; update entry properties
+                (cl-labels
+                    ((update-org-entry
+                      (position property value)
+                      (if (or (null value)
+                              (string= value ""))
+                          (org-entry-delete position property)
+                        (org-entry-put position property value))))
+
+                  (update-org-entry event-pos "ORGANIZER" organizer)
+                  (update-org-entry event-pos "LOCATION" location)
+                  (update-org-entry event-pos "PARTICIPATION_TYPE"
+                                    (symbol-name participation-type))
+                  (update-org-entry event-pos "REQ_PARTICIPANTS"
+                                    (gnus-icalendar--format-participant-list
+                                     req-participants))
+                  (update-org-entry event-pos "OPT_PARTICIPANTS"
+                                    (gnus-icalendar--format-participant-list
+                                     opt-participants))
+                  (update-org-entry event-pos "RRULE" recur)
+                  (update-org-entry
+                   event-pos "REPLY"
+                   (if reply-status (capitalize (symbol-name reply-status))
+                     "Not replied yet")))
+                (save-buffer)))))))))
+
+
+(defun gnus-icalendar--cancel-org-event (event &optional org-file)
+  (let ((file (gnus-icalendar-find-org-event-file event org-file)))
+    (when file
+      (with-current-buffer (find-file-noselect file)
+        (let ((event-pos (org-find-entry-with-id (gnus-icalendar-event:uid event))))
+          (when event-pos
+            (let ((ts (org-entry-get event-pos "DT")))
+              (when ts
+                (org-entry-put event-pos "DT" (gnus-icalendar--deactivate-org-timestamp ts))
+                (save-buffer)))))))))
+
+
+(defun gnus-icalendar--get-org-event-reply-status (event &optional org-file)
+  (let ((file (gnus-icalendar-find-org-event-file event org-file)))
+    (when file
+      (save-excursion
+        (with-current-buffer (find-file-noselect file)
+          (let ((event-pos (org-find-entry-with-id (gnus-icalendar-event:uid event))))
+            (org-entry-get event-pos "REPLY")))))))
+
+
+(defun gnus-icalendar-insinuate-org-templates ()
+  (unless (gnus-icalendar-find-if (lambda (x) (string= (cadr x) gnus-icalendar-org-template-name))
+                      org-capture-templates)
+    (setq org-capture-templates
+          (append `((,gnus-icalendar-org-template-key
+                     ,gnus-icalendar-org-template-name
+                     entry
+                     (file+olp ,gnus-icalendar-org-capture-file ,@gnus-icalendar-org-capture-headline)
+                     "%i"
+                     :immediate-finish t))
+                  org-capture-templates))
+
+    ;; hide the template from interactive template selection list
+    ;; (org-capture)
+    ;; NOTE: doesn't work when capturing from string
+    ;; (when (boundp 'org-capture-templates-contexts)
+    ;;   (push `(,gnus-icalendar-org-template-key "" ((in-mode . "gnus-article-mode")))
+    ;;         org-capture-templates-contexts))
+    ))
+
+(defun gnus-icalendar:org-event-save (event reply-status)
+  (with-temp-buffer
+    (org-capture-string (gnus-icalendar-event->org-entry event reply-status)
+                        gnus-icalendar-org-template-key)))
+
+(defun gnus-icalendar-show-org-agenda (event)
+  (let* ((time-delta (time-subtract (gnus-icalendar-event:end-time event)
+                                    (gnus-icalendar-event:start-time event)))
+         (duration-days (1+ (floor (time-convert time-delta 'integer) 86400))))
+    (org-agenda-list nil (gnus-icalendar-event:start event) duration-days)))
+
+(cl-defmethod gnus-icalendar-event:sync-to-org ((event gnus-icalendar-event-request) reply-status)
+  (if (gnus-icalendar-find-org-event-file event)
+      (gnus-icalendar--update-org-event event reply-status)
+    (gnus-icalendar:org-event-save event reply-status)))
+
+(cl-defmethod gnus-icalendar-event:sync-to-org ((event gnus-icalendar-event-cancel) _reply-status)
+  (when (gnus-icalendar-find-org-event-file event)
+    (gnus-icalendar--cancel-org-event event)))
+
+(defun gnus-icalendar-org-setup ()
+  (if (and gnus-icalendar-org-capture-file gnus-icalendar-org-capture-headline)
+      (progn
+        (gnus-icalendar-insinuate-org-templates)
+        (setq gnus-icalendar-org-enabled-p t))
+    (message "Cannot enable Calendar->Org: missing capture file, headline")))
+
+;;;
+;;; gnus-icalendar
+;;;
+
+(defgroup gnus-icalendar nil
+  "Settings for inline display of iCalendar invitations."
+  :version "24.4"
+  :group 'gnus-article
+  :prefix "gnus-icalendar-")
+
+(defcustom gnus-icalendar-reply-bufname "*CAL*"
+  "Buffer used for building iCalendar invitation reply."
+  :type '(string))
+
+(defcustom gnus-icalendar-additional-identities nil
+  "We need to know your identity to make replies to calendar requests work.
+
+Gnus will only offer you the Accept/Tentative/Decline buttons for
+calendar events if any of your identities matches at least one
+RSVP participant.
+
+Your identity is guessed automatically from the variables
+`user-full-name', `user-mail-address',
+`gnus-ignored-from-addresses' and `message-alternative-emails'.
+
+If you need even more aliases you can define them here.  It really
+only makes sense to define names or email addresses."
+
+  :type '(repeat string))
+
+(defvar-local gnus-icalendar-reply-status nil)
+
+(defvar-local gnus-icalendar-event nil)
+
+(defvar-local gnus-icalendar-handle nil)
+
+(defun gnus-icalendar-identities ()
+  "Return list of regexp-quoted names and email addresses belonging to the user.
+
+These will be used to retrieve the RSVP information from ical events."
+  (apply #'append
+         (mapcar
+          (lambda (x) (if (listp x) x (list x)))
+          (list user-full-name (regexp-quote user-mail-address)
+                ;; NOTE: these can be lists
+                gnus-ignored-from-addresses ; already regexp-quoted
+                (unless (functionp message-alternative-emails) ; String or function.
+                  message-alternative-emails)
+                (mapcar #'regexp-quote gnus-icalendar-additional-identities)))))
+
+;; TODO: make the template customizable
+(cl-defmethod gnus-icalendar-event->gnus-calendar ((event gnus-icalendar-event) &optional reply-status)
+  "Format an overview of EVENT details."
+  (cl-labels
+      ((format-header (x)
+                      (format "%-12s%s"
+                              (propertize (concat (car x) ":") 'face 'bold)
+                              (cadr x))))
+
+    (with-slots (organizer summary description location recur uid
+                           method rsvp participation-type)
+        event
+      (let ((headers `(("Summary" ,summary)
+                       ("Location" ,(or location ""))
+                       ("Time" ,(gnus-icalendar-event:org-timestamp event))
+                       ("Organizer" ,organizer)
+                       ("Attendance" ,(if (eq participation-type 'non-participant)
+                                          "You are not listed as an attendee"
+                                        (capitalize (symbol-name participation-type))))
+                       ("Method" ,method))))
+
+        (when (and (not (gnus-icalendar-event-reply-p event)) rsvp)
+          (setq headers (append headers
+                                `(("Status" ,(or reply-status "Not replied yet"))))))
+
+        (concat
+         (mapconcat #'format-header headers "\n")
+         "\n\n"
+         description)))))
+
+(defmacro gnus-icalendar-with-decoded-handle (handle &rest body)
+  "Execute BODY in buffer containing the decoded contents of HANDLE."
+  (let ((charset (make-symbol "charset")))
+    `(let ((,charset (cdr (assoc 'charset (mm-handle-type ,handle)))))
+       (with-temp-buffer
+         (mm-insert-part ,handle)
+         (when (string= (downcase ,charset) "utf-8")
+           (decode-coding-region (point-min) (point-max) 'utf-8))
+         ,@body))))
+
+
+(defun gnus-icalendar-event-from-handle (handle &optional attendee-name-or-email)
+  (gnus-icalendar-with-decoded-handle handle
+                       (gnus-icalendar-event-from-buffer (current-buffer) attendee-name-or-email)))
+
+(defun gnus-icalendar-insert-button (text callback data)
+  ;; FIXME: the gnus-mime-button-map keymap does not make sense for this kind
+  ;; of button.
+  (let ((start (point)))
+    (add-text-properties
+     start
+     (progn
+       (insert "[ " text " ]")
+       (point))
+     `(gnus-callback
+       ,callback
+       keymap ,gnus-mime-button-map
+       face ,gnus-article-button-face
+       follow-link t
+       button t
+       gnus-data ,data))))
+
+(defun gnus-icalendar-send-buffer-by-mail (buffer-name subject)
+  (let ((message-signature nil))
+    (with-current-buffer gnus-summary-buffer
+      (gnus-summary-reply)
+      (message-goto-body)
+      (mml-insert-multipart "alternative")
+      (mml-insert-empty-tag 'part 'type "text/plain")
+      (mml-attach-buffer buffer-name "text/calendar; method=REPLY; charset=UTF-8")
+      (message-goto-subject)
+      (delete-region (line-beginning-position) (line-end-position))
+      (insert "Subject: " subject)
+      (message-send-and-exit))))
+
+(defun gnus-icalendar-reply (data)
+  (let* ((handle (car data))
+         (status (cadr data))
+         (event (caddr data))
+         (reply (gnus-icalendar-with-decoded-handle handle
+                  (gnus-icalendar-event-reply-from-buffer
+                   (current-buffer) status (gnus-icalendar-identities)))))
+
+    (when reply
+      (cl-labels
+          ((fold-icalendar-buffer
+            ()
+            (goto-char (point-min))
+            (while (re-search-forward "^\\(.\\{72\\}\\)\\(.+\\)$" nil t)
+              (replace-match "\\1\n \\2")
+              (goto-char (line-beginning-position)))))
+        (let ((subject (concat (capitalize (symbol-name status))
+                               ": " (gnus-icalendar-event:summary event))))
+
+          (with-current-buffer (gnus-get-buffer-create gnus-icalendar-reply-bufname)
+            (delete-region (point-min) (point-max))
+            (insert reply)
+            (fold-icalendar-buffer)
+            (gnus-icalendar-send-buffer-by-mail (buffer-name) subject))
+
+          ;; Back in article buffer
+          (setq-local gnus-icalendar-reply-status status)
+          (when gnus-icalendar-org-enabled-p
+            (gnus-icalendar--update-org-event event status)
+            ;; refresh article buffer to update the reply status
+            (with-current-buffer gnus-summary-buffer
+              (gnus-summary-show-article))))))))
+
+(defun gnus-icalendar-sync-event-to-org (event)
+  (gnus-icalendar-event:sync-to-org event gnus-icalendar-reply-status))
+
+(cl-defmethod gnus-icalendar-event:inline-reply-buttons ((event gnus-icalendar-event) handle)
+  (when (gnus-icalendar-event:rsvp event)
+    `(("Accept" gnus-icalendar-reply (,handle accepted ,event))
+      ("Tentative" gnus-icalendar-reply (,handle tentative ,event))
+      ("Decline" gnus-icalendar-reply (,handle declined ,event)))))
+
+(cl-defmethod gnus-icalendar-event:inline-reply-buttons ((_event gnus-icalendar-event-reply) _handle)
+  "No buttons for REPLY events."
+  nil)
+
+(cl-defmethod gnus-icalendar-event:inline-reply-status ((event gnus-icalendar-event))
+  (or (when gnus-icalendar-org-enabled-p
+        (gnus-icalendar--get-org-event-reply-status event))
+      "Not replied yet"))
+
+(cl-defmethod gnus-icalendar-event:inline-reply-status ((_event gnus-icalendar-event-reply))
+  "No reply status for REPLY events."
+  nil)
+
+
+(cl-defmethod gnus-icalendar-event:inline-org-buttons ((event gnus-icalendar-event))
+  (let* ((org-entry-exists-p (gnus-icalendar-find-org-event-file event))
+         (export-button-text (if org-entry-exists-p "Update Org Entry" "Export to Org")))
+
+    (delq nil (list
+               `("Show Agenda" gnus-icalendar-show-org-agenda ,event)
+               (when (gnus-icalendar-event-request-p event)
+                 `(,export-button-text gnus-icalendar-sync-event-to-org ,event))
+               (when org-entry-exists-p
+                 `("Show Org Entry" gnus-icalendar--show-org-event ,event))))))
+
+
+(cl-defmethod gnus-icalendar-event:inline-org-buttons ((event gnus-icalendar-event-cancel))
+  (let ((org-entry-exists-p (gnus-icalendar-find-org-event-file event)))
+
+    (delq nil (list
+               `("Show Agenda" gnus-icalendar-show-org-agenda ,event)
+               (when org-entry-exists-p
+                 `("Update Org Entry" gnus-icalendar-sync-event-to-org ,event))
+               (when org-entry-exists-p
+                 `("Show Org Entry" gnus-icalendar--show-org-event ,event))))))
+
+;;;###autoload
+(defun gnus-icalendar-mm-inline (handle)
+  (let ((event (gnus-icalendar-event-from-handle handle (gnus-icalendar-identities))))
+
+    (setq gnus-icalendar-reply-status nil)
+
+    (when event
+      (cl-labels
+          ((insert-button-group
+            (buttons)
+            (when buttons
+              (mapc (lambda (x)
+                      (apply #'gnus-icalendar-insert-button x)
+                      (insert "    "))
+                    buttons)
+              (insert "\n\n"))))
+
+        (insert-button-group
+         (gnus-icalendar-event:inline-reply-buttons event handle))
+
+        (when gnus-icalendar-org-enabled-p
+          (insert-button-group (gnus-icalendar-event:inline-org-buttons event)))
+
+        (setq gnus-icalendar-event event
+              gnus-icalendar-handle handle)
+
+        (insert (gnus-icalendar-event->gnus-calendar
+                 event
+                 (gnus-icalendar-event:inline-reply-status event)))))))
+
+(defun gnus-icalendar-save-part (handle)
+  (let (event)
+    (when (and (equal (car (mm-handle-type handle)) "text/calendar")
+               (setq event (gnus-icalendar-event-from-handle handle (gnus-icalendar-identities))))
+
+      (gnus-icalendar-event:sync-to-org event))))
+
+
+(defun gnus-icalendar-save-event ()
+  "Save the Calendar event in the text/calendar part under point."
+  (interactive)
+  (gnus-article-check-buffer)
+  (let ((data (get-text-property (point) 'gnus-data)))
+    (when data
+      (gnus-icalendar-save-part data))))
+
+(defun gnus-icalendar-reply-accept ()
+  "Accept invitation in the current article."
+  (interactive)
+  (with-current-buffer gnus-article-buffer
+    (gnus-icalendar-reply (list gnus-icalendar-handle 'accepted gnus-icalendar-event))
+    (setq-local gnus-icalendar-reply-status 'accepted)))
+
+(defun gnus-icalendar-reply-tentative ()
+  "Send tentative response to invitation in the current article."
+  (interactive)
+  (with-current-buffer gnus-article-buffer
+    (gnus-icalendar-reply (list gnus-icalendar-handle 'tentative gnus-icalendar-event))
+    (setq-local gnus-icalendar-reply-status 'tentative)))
+
+(defun gnus-icalendar-reply-decline ()
+  "Decline invitation in the current article."
+  (interactive)
+  (with-current-buffer gnus-article-buffer
+    (gnus-icalendar-reply (list gnus-icalendar-handle 'declined gnus-icalendar-event))
+    (setq-local gnus-icalendar-reply-status 'declined)))
+
+(defun gnus-icalendar-event-export ()
+  "Export calendar event to `org-mode', or update existing agenda entry."
+  (interactive)
+  (with-current-buffer gnus-article-buffer
+    (gnus-icalendar-sync-event-to-org gnus-icalendar-event))
+  ;; refresh article buffer in case the reply had been sent before initial org
+  ;; export
+  (with-current-buffer gnus-summary-buffer
+    (gnus-summary-show-article)))
+
+(defun gnus-icalendar-event-show ()
+  "Display `org-mode' agenda entry related to the calendar event."
+  (interactive)
+  (gnus-icalendar--show-org-event
+   (with-current-buffer gnus-article-buffer
+     gnus-icalendar-event)))
+
+(defun gnus-icalendar-event-check-agenda ()
+  "Display `org-mode' agenda for days between event start and end dates."
+  (interactive)
+  (gnus-icalendar-show-org-agenda
+   (with-current-buffer gnus-article-buffer gnus-icalendar-event)))
+
+(defvar gnus-mime-action-alist)         ; gnus-art
+
+(defun gnus-icalendar-setup ()
+  ;; FIXME: Get rid of this!
+  ;; The three add-to-list are now redundant (good), but I think the rest
+  ;; is still not automatically setup.
+  (add-to-list 'mm-inlined-types "text/calendar")
+  (add-to-list 'mm-automatic-display "text/calendar")
+  (add-to-list 'mm-inline-media-tests '("text/calendar" gnus-icalendar-mm-inline identity))
+
+  (gnus-define-keys (gnus-summary-calendar-map "i" gnus-summary-mode-map)
+    "a" gnus-icalendar-reply-accept
+    "t" gnus-icalendar-reply-tentative
+    "d" gnus-icalendar-reply-decline
+    "c" gnus-icalendar-event-check-agenda
+    "e" gnus-icalendar-event-export
+    "s" gnus-icalendar-event-show)
+
+  (require 'gnus-art)
+  (add-to-list 'gnus-mime-action-alist
+               (cons "save calendar event" #'gnus-icalendar-save-event)
+               t))
+
+(provide 'gnus-icalendar)
+
+;;; gnus-icalendar.el ends here
+#+end_src
+
+* Creating icalendar events
+Given an elisp event
+#+begin_src emacs-lisp
+(setq event #s(gnus-icalendar-event-request "fpi_314@gmx.de" "Test Termin" "Testbeschreibung
+des EIntrags" "ATF8" (24286 10304) (24286 21104) nil "29307bda-6bfd-46d1-b971-9323af2e8332.kalender.gmx.net" "REQUEST" t required ("ferdinand.pieper@ims.uni-hannover.de") nil))
+#+end_src
+
+#+RESULTS:
+: #s(gnus-icalendar-event-request "fpi_314@gmx.de" "Test Termin" "Testbeschreibung
+: des EIntrags" "ATF8" (24286 10304) (24286 21104) nil "29307bda-6bfd-46d1-b971-9323af2e8332.kalender.gmx.net" "REQUEST" t required ("ferdinand.pieper@ims.uni-hannover.de") nil)
+
+We want to create a request as this one:
+#+begin_src text
+BEGIN:VCALENDAR
+PRODID:-//1&1 Mail & Media GmbH/WEB.DE Kalender Server
+VERSION:2.0
+CALSCALE:GREGORIAN
+METHOD:REQUEST
+BEGIN:VEVENT
+DTSTAMP:20200516T135443Z
+SUMMARY:Test Termin
+DESCRIPTION:Testbeschreibung\ndes EIntrags
+DTEND;TZID=Europe/Brussels:20200608T170000
+DTSTART;TZID=Europe/Brussels:20200608T140000
+ATTENDEE;PARTSTAT=NEEDS-ACTION;ROLE=REQ-PARTICIPANT;RSVP=TRUE;CN=ferdinand.pieper@ims.uni-hannover.de:MAILTO:ferdinand.pieper@ims.uni-hannover.de
+LOCATION:ATF8
+ORGANIZER;CN=Ferdinand Pieper:MAILTO:fpi_314@gmx.de
+UID:29307bda-6bfd-46d1-b971-9323af2e8332.kalender.gmx.net
+SEQUENCE:0
+END:VEVENT
+BEGIN:VTIMEZONE
+TZID:Europe/Brussels
+TZURL:http://tzurl.org/zoneinfo/Europe/Brussels
+X-LIC-LOCATION:Europe/Brussels
+BEGIN:DAYLIGHT
+TZOFFSETFROM:+0100
+TZOFFSETTO:+0200
+TZNAME:CEST
+DTSTART:19810329T020000
+RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU
+END:DAYLIGHT
+BEGIN:STANDARD
+TZOFFSETFROM:+0200
+TZOFFSETTO:+0100
+TZNAME:CET
+DTSTART:19961027T030000
+RRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU
+END:STANDARD
+BEGIN:STANDARD
+TZOFFSETFROM:+001730
+TZOFFSETTO:+001730
+TZNAME:BMT
+DTSTART:18800101T000000
+RDATE:18800101T000000
+END:STANDARD
+BEGIN:STANDARD
+TZOFFSETFROM:+001730
+TZOFFSETTO:+0000
+TZNAME:WET
+DTSTART:18920501T120000
+RDATE:18920501T120000
+END:STANDARD
+BEGIN:STANDARD
+TZOFFSETFROM:+0000
+TZOFFSETTO:+0100
+TZNAME:CET
+DTSTART:19141108T000000
+RDATE:19141108T000000
+END:STANDARD
+BEGIN:DAYLIGHT
+TZOFFSETFROM:+0100
+TZOFFSETTO:+0200
+TZNAME:CEST
+DTSTART:19160430T230000
+RDATE:19160430T230000
+RDATE:19170416T020000
+RDATE:19180415T020000
+RDATE:19400520T030000
+RDATE:19430329T020000
+RDATE:19440403T020000
+RDATE:19450402T020000
+RDATE:19460519T020000
+RDATE:19770403T020000
+RDATE:19780402T020000
+RDATE:19790401T020000
+RDATE:19800406T020000
+END:DAYLIGHT
+BEGIN:STANDARD
+TZOFFSETFROM:+0200
+TZOFFSETTO:+0100
+TZNAME:CET
+DTSTART:19161001T010000
+RDATE:19161001T010000
+RDATE:19170917T030000
+RDATE:19180916T030000
+RDATE:19421102T030000
+RDATE:19431004T030000
+RDATE:19440917T030000
+RDATE:19450916T020000
+RDATE:19461007T030000
+RDATE:19770925T030000
+RDATE:19781001T030000
+RDATE:19790930T030000
+RDATE:19800928T030000
+RDATE:19810927T030000
+RDATE:19820926T030000
+RDATE:19830925T030000
+RDATE:19840930T030000
+RDATE:19850929T030000
+RDATE:19860928T030000
+RDATE:19870927T030000
+RDATE:19880925T030000
+RDATE:19890924T030000
+RDATE:19900930T030000
+RDATE:19910929T030000
+RDATE:19920927T030000
+RDATE:19930926T030000
+RDATE:19940925T030000
+RDATE:19950924T030000
+END:STANDARD
+BEGIN:STANDARD
+TZOFFSETFROM:+0100
+TZOFFSETTO:+0000
+TZNAME:WET
+DTSTART:19181111T120000
+RDATE:19181111T120000
+RDATE:19191005T000000
+RDATE:19201024T000000
+RDATE:19211026T000000
+RDATE:19221008T000000
+RDATE:19231007T000000
+RDATE:19241005T000000
+RDATE:19251004T000000
+RDATE:19261003T000000
+RDATE:19271002T000000
+RDATE:19281007T030000
+RDATE:19291006T030000
+RDATE:19301005T030000
+RDATE:19311004T030000
+RDATE:19321002T030000
+RDATE:19331008T030000
+RDATE:19341007T030000
+RDATE:19351006T030000
+RDATE:19361004T030000
+RDATE:19371003T030000
+RDATE:19381002T030000
+RDATE:19391119T030000
+END:STANDARD
+BEGIN:DAYLIGHT
+TZOFFSETFROM:+0000
+TZOFFSETTO:+0100
+TZNAME:WEST
+DTSTART:19190301T230000
+RDATE:19190301T230000
+RDATE:19200214T230000
+RDATE:19210314T230000
+RDATE:19220325T230000
+RDATE:19230421T230000
+RDATE:19240329T230000
+RDATE:19250404T230000
+RDATE:19260417T230000
+RDATE:19270409T230000
+RDATE:19280414T230000
+RDATE:19290421T020000
+RDATE:19300413T020000
+RDATE:19310419T020000
+RDATE:19320403T020000
+RDATE:19330326T020000
+RDATE:19340408T020000
+RDATE:19350331T020000
+RDATE:19360419T020000
+RDATE:19370404T020000
+RDATE:19380327T020000
+RDATE:19390416T020000
+RDATE:19400225T020000
+END:DAYLIGHT
+BEGIN:DAYLIGHT
+TZOFFSETFROM:+0200
+TZOFFSETTO:+0200
+TZNAME:CEST
+DTSTART:19440903T000000
+RDATE:19440903T000000
+END:DAYLIGHT
+BEGIN:STANDARD
+TZOFFSETFROM:+0100
+TZOFFSETTO:+0100
+TZNAME:CET
+DTSTART:19770101T000000
+RDATE:19770101T000000
+END:STANDARD
+END:VTIMEZONE
+END:VCALENDAR
+#+end_src
+
+which can be parsed as this elisp structure:
+#+begin_src emacs-lisp
+(setq ical
+'((VCALENDAR nil ((PRODID nil "-//1&1 Mail & Media GmbH/WEB.DE Kalender Server") (VERSION nil "2.0") (CALSCALE nil "GREGORIAN") (METHOD nil "REQUEST")) ((VEVENT nil ((DTSTAMP nil "20200516T135443Z") (SUMMARY nil "Test Termin") (DESCRIPTION nil "Testbeschreibung\\ndes EIntrags") (DTEND (TZID "Europe/Brussels") "20200608T170000") (DTSTART (TZID "Europe/Brussels") "20200608T140000") (ATTENDEE (PARTSTAT "NEEDS-ACTION" ROLE "REQ-PARTICIPANT" RSVP "TRUE" CN "ferdinand.pieper@ims.uni-hannover.de") "MAILTO:ferdinand.pieper@ims.uni-hannover.de") (LOCATION nil "ATF8") (ORGANIZER (CN "Ferdinand Pieper") "MAILTO:fpi_314@gmx.de") (UID nil "29307bda-6bfd-46d1-b971-9323af2e8332.kalender.gmx.net") (SEQUENCE nil "0")) nil) (VTIMEZONE nil ((TZID nil "Europe/Brussels") (TZURL nil "http://tzurl.org/zoneinfo/Europe/Brussels") (X-LIC-LOCATION nil "Europe/Brussels")) ((DAYLIGHT nil ((TZOFFSETFROM nil "+0100") (TZOFFSETTO nil "+0200") (TZNAME nil "CEST") (DTSTART nil "19810329T020000") (RRULE nil "FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU")) nil) (STANDARD nil ((TZOFFSETFROM nil "+0200") (TZOFFSETTO nil "+0100") (TZNAME nil "CET") (DTSTART nil "19961027T030000") (RRULE nil "FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU")) nil) (STANDARD nil ((TZOFFSETFROM nil "+001730") (TZOFFSETTO nil "+001730") (TZNAME nil "BMT") (DTSTART nil "18800101T000000") (RDATE nil "18800101T000000")) nil) (STANDARD nil ((TZOFFSETFROM nil "+001730") (TZOFFSETTO nil "+0000") (TZNAME nil "WET") (DTSTART nil "18920501T120000") (RDATE nil "18920501T120000")) nil) (STANDARD nil ((TZOFFSETFROM nil "+0000") (TZOFFSETTO nil "+0100") (TZNAME nil "CET") (DTSTART nil "19141108T000000") (RDATE nil "19141108T000000")) nil) (DAYLIGHT nil ((TZOFFSETFROM nil "+0100") (TZOFFSETTO nil "+0200") (TZNAME nil "CEST") (DTSTART nil "19160430T230000") (RDATE nil "19160430T230000") (RDATE nil "19170416T020000") (RDATE nil "19180415T020000") (RDATE nil "19400520T030000") (RDATE nil "19430329T020000") (RDATE nil "19440403T020000") (RDATE nil "19450402T020000") (RDATE nil "19460519T020000") (RDATE nil "19770403T020000") (RDATE nil "19780402T020000") (RDATE nil "19790401T020000") (RDATE nil "19800406T020000")) nil) (STANDARD nil ((TZOFFSETFROM nil "+0200") (TZOFFSETTO nil "+0100") (TZNAME nil "CET") (DTSTART nil "19161001T010000") (RDATE nil "19161001T010000") (RDATE nil "19170917T030000") (RDATE nil "19180916T030000") (RDATE nil "19421102T030000") (RDATE nil "19431004T030000") (RDATE nil "19440917T030000") (RDATE nil "19450916T020000") (RDATE nil "19461007T030000") (RDATE nil "19770925T030000") (RDATE nil "19781001T030000") (RDATE nil "19790930T030000") (RDATE nil "19800928T030000") (RDATE nil "19810927T030000") (RDATE nil "19820926T030000") (RDATE nil "19830925T030000") (RDATE nil "19840930T030000") (RDATE nil "19850929T030000") (RDATE nil "19860928T030000") (RDATE nil "19870927T030000") (RDATE nil "19880925T030000") (RDATE nil "19890924T030000") (RDATE nil "19900930T030000") (RDATE nil "19910929T030000") (RDATE nil "19920927T030000") (RDATE nil "19930926T030000") (RDATE nil "19940925T030000") (RDATE nil "19950924T030000")) nil) (STANDARD nil ((TZOFFSETFROM nil "+0100") (TZOFFSETTO nil "+0000") (TZNAME nil "WET") (DTSTART nil "19181111T120000") (RDATE nil "19181111T120000") (RDATE nil "19191005T000000") (RDATE nil "19201024T000000") (RDATE nil "19211026T000000") (RDATE nil "19221008T000000") (RDATE nil "19231007T000000") (RDATE nil "19241005T000000") (RDATE nil "19251004T000000") (RDATE nil "19261003T000000") (RDATE nil "19271002T000000") (RDATE nil "19281007T030000") (RDATE nil "19291006T030000") (RDATE nil "19301005T030000") (RDATE nil "19311004T030000") (RDATE nil "19321002T030000") (RDATE nil "19331008T030000") (RDATE nil "19341007T030000") (RDATE nil "19351006T030000") (RDATE nil "19361004T030000") (RDATE nil "19371003T030000") (RDATE nil "19381002T030000") (RDATE nil "19391119T030000")) nil) (DAYLIGHT nil ((TZOFFSETFROM nil "+0000") (TZOFFSETTO nil "+0100") (TZNAME nil "WEST") (DTSTART nil "19190301T230000") (RDATE nil "19190301T230000") (RDATE nil "19200214T230000") (RDATE nil "19210314T230000") (RDATE nil "19220325T230000") (RDATE nil "19230421T230000") (RDATE nil "19240329T230000") (RDATE nil "19250404T230000") (RDATE nil "19260417T230000") (RDATE nil "19270409T230000") (RDATE nil "19280414T230000") (RDATE nil "19290421T020000") (RDATE nil "19300413T020000") (RDATE nil "19310419T020000") (RDATE nil "19320403T020000") (RDATE nil "19330326T020000") (RDATE nil "19340408T020000") (RDATE nil "19350331T020000") (RDATE nil "19360419T020000") (RDATE nil "19370404T020000") (RDATE nil "19380327T020000") (RDATE nil "19390416T020000") (RDATE nil "19400225T020000")) nil) (DAYLIGHT nil ((TZOFFSETFROM nil "+0200") (TZOFFSETTO nil "+0200") (TZNAME nil "CEST") (DTSTART nil "19440903T000000") (RDATE nil "19440903T000000")) nil) (STANDARD nil ((TZOFFSETFROM nil "+0100") (TZOFFSETTO nil "+0100") (TZNAME nil "CET") (DTSTART nil "19770101T000000") (RDATE nil "19770101T000000")) nil)))))))
+#+end_src
+
+#+begin_src emacs-lisp :results raw
+(setq event (car (icalendar--all-events ical)))
+#+end_src
+
+#+RESULTS:
+(VEVENT nil ((DTSTAMP nil 20200516T135443Z) (SUMMARY nil Test Termin) (DESCRIPTION nil Testbeschreibung\ndes EIntrags) (DTEND (TZID Europe/Brussels) 20200608T170000) (DTSTART (TZID Europe/Brussels) 20200608T140000) (ATTENDEE (PARTSTAT NEEDS-ACTION ROLE REQ-PARTICIPANT RSVP TRUE CN ferdinand.pieper@ims.uni-hannover.de) MAILTO:ferdinand.pieper@ims.uni-hannover.de) (LOCATION nil ATF8) (ORGANIZER (CN Ferdinand Pieper) MAILTO:fpi_314@gmx.de) (UID nil 29307bda-6bfd-46d1-b971-9323af2e8332.kalender.gmx.net) (SEQUENCE nil 0)) nil)
+
+Function is similar to ~gnus-icalendar-event-reply-from-buffer~.
+#+begin_src emacs-lisp
+(gnus-icalendar-event--build-reply-event-body event 'tentative '("ferdinand\\.pieper@ims\\.uni-hannover\\.de" "ferdinand\\.pieper@ims\\.uni-hannover\\.de"))
+#+end_src
+
+** Icalendar RFC5545 spec
+*** Example VCALENDAR
+**** Meeting Invites & Replys
+***** Summary
+****** VEVENT
+| Properties                     | gnus-icalendar | Thunderbird | Evolution   | 1&1 Mail |
+|--------------------------------+----------------+-------------+-------------+----------|
+| dtstamp                        |                | x           | x           | x        |
+| summary                        | x              | x           | x           | x        |
+| description                    | x              | x           | x           | x        |
+| dtend                          | x              | x           | x           | x        |
+| dtstart                        | x              | x           | x           | x        |
+| attendee                       | x              | x           | x           | x        |
+| location                       | x              | x           |             | x        |
+| organizer                      | x              | x           | x           | x        |
+| uid                            | x              | x           | x           | x        |
+| sequence                       |                | x           | x           | x        |
+| class                          | TODO           | PUBLIC      | PUBLIC      |          |
+| created                        |                | x           | x           |          |
+| last-modified                  |                | x           | x           |          |
+| priority                       |                | 5           | 5           |          |
+| transp                         | TODO?          | OPAQUE      | OPAQUE      |          |
+| x-alt-desc                     |                | x           | x           |          |
+| fmttype                        |                | text/html   | 3Dtext/html |          |
+| X-MICROSOFT-CDO-BUSYSTATUS     |                | x           | x           |          |
+| X-MICROSOFT-CDO-IMPORTANCE     |                | x           | x           |          |
+| X-MICROSOFT-CDO-INTENDEDSTATUS |                | x           | x           |          |
+| X-MICROSOFT-DISALLOW-COUNTER   |                | x           | x           |          |
+| X-MS-OLK-AUTOSTARTCHECK        |                | x           | x           |          |
+| X-MS-OLK-CONFTYPE              |                | x           | x           |          |
+| X-MICROSOFT-CDO-REPLYTIME      |                |             | x           |          |
+| RRULE                          | x              | ?           | ?           | ?        |
+***** Gmx.net invite
+#+begin_src fundamental
+BEGIN:VCALENDAR
+PRODID:-//1&1 Mail & Media GmbH/WEB.DE Kalender Server
+VERSION:2.0
+CALSCALE:GREGORIAN
+METHOD:REQUEST
+BEGIN:VEVENT
+DTSTAMP:20200516T135443Z
+SUMMARY:Test Termin
+DESCRIPTION:Testbeschreibung\ndes EIntrags
+DTEND;TZID=Europe/Brussels:20200608T170000
+DTSTART;TZID=Europe/Brussels:20200608T140000
+ATTENDEE;PARTSTAT=NEEDS-ACTION;ROLE=REQ-PARTICIPANT;RSVP=TRUE;CN=ferdinand.pieper@ims.uni-hannover.de:MAILTO:ferdinand.pieper@ims.uni-hannover.de
+LOCATION:ATF8
+ORGANIZER;CN=Ferdinand Pieper:MAILTO:fpi_314@gmx.de
+UID:29307bda-6bfd-46d1-b971-9323af2e8332.kalender.gmx.net
+SEQUENCE:0
+END:VEVENT
+BEGIN:VTIMEZONE
+TZID:Europe/Brussels
+TZURL:http://tzurl.org/zoneinfo/Europe/Brussels
+X-LIC-LOCATION:Europe/Brussels
+BEGIN:DAYLIGHT
+TZOFFSETFROM:+0100
+TZOFFSETTO:+0200
+TZNAME:CEST
+DTSTART:19810329T020000
+RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU
+END:DAYLIGHT
+BEGIN:STANDARD
+TZOFFSETFROM:+0200
+TZOFFSETTO:+0100
+TZNAME:CET
+DTSTART:19961027T030000
+RRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU
+END:STANDARD
+BEGIN:STANDARD
+TZOFFSETFROM:+001730
+TZOFFSETTO:+001730
+TZNAME:BMT
+DTSTART:18800101T000000
+RDATE:18800101T000000
+END:STANDARD
+BEGIN:STANDARD
+TZOFFSETFROM:+001730
+TZOFFSETTO:+0000
+TZNAME:WET
+DTSTART:18920501T120000
+RDATE:18920501T120000
+END:STANDARD
+BEGIN:STANDARD
+TZOFFSETFROM:+0000
+TZOFFSETTO:+0100
+TZNAME:CET
+DTSTART:19141108T000000
+RDATE:19141108T000000
+END:STANDARD
+BEGIN:DAYLIGHT
+TZOFFSETFROM:+0100
+TZOFFSETTO:+0200
+TZNAME:CEST
+DTSTART:19160430T230000
+RDATE:19160430T230000
+RDATE:19170416T020000
+RDATE:19180415T020000
+RDATE:19400520T030000
+RDATE:19430329T020000
+RDATE:19440403T020000
+RDATE:19450402T020000
+RDATE:19460519T020000
+RDATE:19770403T020000
+RDATE:19780402T020000
+RDATE:19790401T020000
+RDATE:19800406T020000
+END:DAYLIGHT
+BEGIN:STANDARD
+TZOFFSETFROM:+0200
+TZOFFSETTO:+0100
+TZNAME:CET
+DTSTART:19161001T010000
+RDATE:19161001T010000
+RDATE:19170917T030000
+RDATE:19180916T030000
+RDATE:19421102T030000
+RDATE:19431004T030000
+RDATE:19440917T030000
+RDATE:19450916T020000
+RDATE:19461007T030000
+RDATE:19770925T030000
+RDATE:19781001T030000
+RDATE:19790930T030000
+RDATE:19800928T030000
+RDATE:19810927T030000
+RDATE:19820926T030000
+RDATE:19830925T030000
+RDATE:19840930T030000
+RDATE:19850929T030000
+RDATE:19860928T030000
+RDATE:19870927T030000
+RDATE:19880925T030000
+RDATE:19890924T030000
+RDATE:19900930T030000
+RDATE:19910929T030000
+RDATE:19920927T030000
+RDATE:19930926T030000
+RDATE:19940925T030000
+RDATE:19950924T030000
+END:STANDARD
+BEGIN:STANDARD
+TZOFFSETFROM:+0100
+TZOFFSETTO:+0000
+TZNAME:WET
+DTSTART:19181111T120000
+RDATE:19181111T120000
+RDATE:19191005T000000
+RDATE:19201024T000000
+RDATE:19211026T000000
+RDATE:19221008T000000
+RDATE:19231007T000000
+RDATE:19241005T000000
+RDATE:19251004T000000
+RDATE:19261003T000000
+RDATE:19271002T000000
+RDATE:19281007T030000
+RDATE:19291006T030000
+RDATE:19301005T030000
+RDATE:19311004T030000
+RDATE:19321002T030000
+RDATE:19331008T030000
+RDATE:19341007T030000
+RDATE:19351006T030000
+RDATE:19361004T030000
+RDATE:19371003T030000
+RDATE:19381002T030000
+RDATE:19391119T030000
+END:STANDARD
+BEGIN:DAYLIGHT
+TZOFFSETFROM:+0000
+TZOFFSETTO:+0100
+TZNAME:WEST
+DTSTART:19190301T230000
+RDATE:19190301T230000
+RDATE:19200214T230000
+RDATE:19210314T230000
+RDATE:19220325T230000
+RDATE:19230421T230000
+RDATE:19240329T230000
+RDATE:19250404T230000
+RDATE:19260417T230000
+RDATE:19270409T230000
+RDATE:19280414T230000
+RDATE:19290421T020000
+RDATE:19300413T020000
+RDATE:19310419T020000
+RDATE:19320403T020000
+RDATE:19330326T020000
+RDATE:19340408T020000
+RDATE:19350331T020000
+RDATE:19360419T020000
+RDATE:19370404T020000
+RDATE:19380327T020000
+RDATE:19390416T020000
+RDATE:19400225T020000
+END:DAYLIGHT
+BEGIN:DAYLIGHT
+TZOFFSETFROM:+0200
+TZOFFSETTO:+0200
+TZNAME:CEST
+DTSTART:19440903T000000
+RDATE:19440903T000000
+END:DAYLIGHT
+BEGIN:STANDARD
+TZOFFSETFROM:+0100
+TZOFFSETTO:+0100
+TZNAME:CET
+DTSTART:19770101T000000
+RDATE:19770101T000000
+END:STANDARD
+END:VTIMEZONE
+END:VCALENDAR
+#+end_src
+***** sogo reply to outlook
+#+begin_src fundamental
+BEGIN:VCALENDAR
+PRODID:-//Ximian//NONSGML Evolution Calendar//EN
+VERSION:2.0
+CALSCALE:GREGORIAN
+BEGIN:VTIMEZONE
+TZID:W. Europe Standard Time
+BEGIN:STANDARD
+DTSTART:16011028T030000
+RRULE:FREQ=3DYEARLY;BYMONTH=3D10;BYDAY=3D-1SU
+TZOFFSETFROM:+0200
+TZOFFSETTO:+0100
+END:STANDARD
+BEGIN:DAYLIGHT
+DTSTART:16010325T020000
+RRULE:FREQ=3DYEARLY;BYMONTH=3D3;BYDAY=3D-1SU
+TZOFFSETFROM:+0100
+TZOFFSETTO:+0200
+END:DAYLIGHT
+END:VTIMEZONE
+BEGIN:VEVENT
+ATTENDEE;PARTSTAT=3DACCEPTED;CN=3D'Christoph Rindfleisch' (christoph.ri=
+ndfleisc
+ h@ims.uni-hannover.de);RSVP=3DTRUE:mailto:christoph.rindfleisch@ims.un=
+i-hann
+ over.de
+CLASS:PUBLIC
+CREATED:20200507T190744Z
+DESCRIPTION:dummy
+DTEND;TZID=3DW. Europe Standard Time:20200508T140000
+DTSTAMP:20200507T190744Z
+DTSTART;TZID=3DW. Europe Standard Time:20200508T133000
+LAST-MODIFIED:20200507T190744Z
+PRIORITY:5
+SEQUENCE:0
+SUMMARY;LANGUAGE=3Dde:AC-Simulation Induktivit=C3=A4t
+TRANSP:OPAQUE
+UID:040000008200E00074C5B7101A82E00800000000D0733B88B024D60100000000000=
+0000
+ 010000000051F64DB44747A4A831E85C825C03E52
+X-ALT-DESC;FMTTYPE=3Dtext/html:<!DOCTYPE HTML PUBLIC -//W3C//DTD HTML 3=
+.2//EN
+ >\n<HTML>\n<HEAD>\n<META NAME=3DGenerator CONTENT=3DMS Exchange Server=
+ version
+  14.02.5004.000>\n<TITLE></TITLE>\n</HEAD>\n<BODY>\n<!-- Converted fro=
+m te
+ xt/rtf format -->\n\n<P DIR=3DLTR><SPAN LANG=3Dde><FONT FACE=3DCalibri=
+>Hallo Chr
+ istoph\,</FONT></SPAN></P>\n\n<P DIR=3DLTR><SPAN LANG=3Dde><FONT FACE=3D=
+Calibri>
+ von Globalfoundries habe ich Zugriff auf deren Spulenmodelle erhalten.=
+ Nun
+  wollte ich deren Spulen einmal simulieren und mit einer AC Quelle Fre=
+quen
+ zverhalten und Induktivit=C3=A4t bestimmen\, um es mit den Werten von =
+Globalfou
+ ndries zu vergleichen.</FONT></SPAN></P>\n\n<P DIR=3DLTR><SPAN LANG=3D=
+de><FONT
+  FACE=3DCalibri>Leider komme ich in der Simulation auf Indukivit=C3=A4=
+ten um 50mH
+ \, Globalfoundries aber auf =E2=89=88100nH=E2=80=A6</FONT></SPAN></P>\=
+n\n<P DIR=3DLTR><SPAN
+ LANG=3Dde><FONT FACE=3DCalibri>H=C3=A4ttest du morgen kurz Zeit um zu =
+schauen\, ob
+ ich bei der Simulation einen dummen Fehler gemacht habe\, bevor bei de=
+nen
+ von Globalfoundries nachfrage?</FONT></SPAN></P>\n\n<P DIR=3DLTR><SPAN=
+ LANG=3D
+ de><FONT FACE=3DCalibri>Am einfachsten w=C3=A4re wohl =C3=BCber Jitsi:=
+</FONT></SPAN><S
+ PAN LANG=3Dde> </SPAN><A HREF=3Dhttps://meet.uni-hannover.de/inclinedn=
+avigatio
+ nsdiminishforever><SPAN LANG=3Dde><U><FONT COLOR=3D#0000FF FACE=3DCali=
+bri>https:
+ //meet.uni-hannover.de/inclinednavigationsdiminishforever</FONT></U></=
+SPAN
+ ><SPAN LANG=3Dde></SPAN></A><SPAN LANG=3Dde></SPAN></P>\n\n<P DIR=3DLT=
+R><SPAN LA
+ NG=3Dde><FONT FACE=3DCalibri>Danke &amp\; Viele Gr=C3=BC=C3=9Fe\,</FON=
+T></SPAN></P>\n\n<
+ P DIR=3DLTR><SPAN LANG=3Dde><FONT FACE=3DCalibri>Ferdinand</FONT></SPA=
+N><SPAN LA
+ NG=3Dde></SPAN></P>\n\n</BODY>\n</HTML>
+X-MICROSOFT-CDO-BUSYSTATUS:TENTATIVE
+X-MICROSOFT-CDO-IMPORTANCE:1
+X-MICROSOFT-CDO-INTENDEDSTATUS:BUSY
+X-MICROSOFT-DISALLOW-COUNTER:FALSE
+X-MS-OLK-AUTOSTARTCHECK:FALSE
+X-MS-OLK-CONFTYPE:0
+X-MICROSOFT-CDO-REPLYTIME:20200508T074226Zw
+ORGANIZER;CN=3Dferdinand.pieper@ims.uni-hannover.de:mailto:ferdinand.pi=
+eper@i
+ ms.uni-hannover.de
+END:VEVENT
+END:VCALENDAR
+#+end_src
+***** reply to outlook invite
+#+begin_src fundamental
+BEGIN:VCALENDAR
+PRODID:-//Mozilla.org/NONSGML Mozilla Calendar V1.1//EN
+VERSION:2.0
+METHOD:REPLY
+BEGIN:VTIMEZONE
+TZID:Europe/Berlin
+BEGIN:DAYLIGHT
+TZOFFSETFROM:+0100
+TZOFFSETTO:+0200
+TZNAME:CEST
+DTSTART:19700329T020000
+RRULE:FREQ=YEARLY;BYDAY=-1SU;BYMONTH=3
+END:DAYLIGHT
+BEGIN:STANDARD
+TZOFFSETFROM:+0200
+TZOFFSETTO:+0100
+TZNAME:CET
+DTSTART:19701025T030000
+RRULE:FREQ=YEARLY;BYDAY=-1SU;BYMONTH=10
+END:STANDARD
+END:VTIMEZONE
+BEGIN:VEVENT
+CREATED:20200506T144949Z
+LAST-MODIFIED:20200510T200142Z
+DTSTAMP:20200510T200142Z
+UID:040000008200E00074C5B7101A82E00800000000409E8A08C523D60100000000000000
+ 0010000000E27A73CB6DD9D5459A26F0DFA286EA96
+SUMMARY:ERMI Project Call
+PRIORITY:5
+ORGANIZER;CN=Ferdinand Pieper:mailto:ferdinand.pieper@ims.uni-hannover.de
+
+ATTENDEE;CN=Catherine Dubourdieu;PARTSTAT=ACCEPTED:mailto:Catherine.dubour
+ dieu@helmholtz-berlin.de
+DTSTART;TZID=Europe/Berlin:20200526T140000
+DTEND;TZID=Europe/Berlin:20200526T160000
+CLASS:PUBLIC
+DESCRIPTION:Dear ERMI team\,\n\nplease find the invitation to our next pro
+ ject call below. I setup a meeting using Webex\, which should give us a be
+ tter experience than in the last call. You can join the meeting using the
+ link below.\n\nThanks and best regards\,\n\nFerdinand\n\n\nERMI Project Ca
+ ll\nAusgerichtet von Ferdinand Pieper\n\nDienstag\, 26 Mai\, 2020 14:00 |
+ 2 Stunden | (UTC+02:00) Amsterdam\, Berlin\, Bern\, Rom\, Stockholm\, Wien
+ \nMeeting-Kennnummer: 236 070 401\nPasswort: 7VkfK2GmWr3\nhttps://luis-uni
+ -hannover.webex.com/luis-uni-hannover/j.php?MTID=m9612d281a58442d10e18e721
+ f199180a\n\nÜber Videosystem beitreten\nWählen Sie 236070401@luis-uni-ha
+ nnover.webex.com\nSie können auch 62.109.219.4 wählen und Ihre Meeting-N
+ ummer eingeben.\n\nÜber Telefon beitreten\n+49-619-6781-9736 Germany Toll
+ \n+49-69-2551-14400 Germany Toll 2\nZugriffscode: 236 070 401\n\n\n--\nM.S
+ c. Ferdinand Pieper\nInstitut für Mikroelektronische Systeme\nFachgebiet
+ Entwurf integrierter Mixed-Signal-Schaltungen\nLeibniz Universität Hannov
+ er - https://www.ims.uni-hannover.de <https://www.ims.uni-hannover.de/> \n
+ \n\n\n
+LOCATION:Webex https://luis-uni-hannover.webex.com/luis-uni-hannover/j.php
+ ?MTID=m9612d281a58442d10e18e721f199180a
+SEQUENCE:0
+TRANSP:OPAQUE
+X-ALT-DESC;FMTTYPE=text/html:<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//
+ EN">\n<HTML>\n<HEAD>\n<META NAME="Generator" CONTENT="MS Exchange Server v
+ ersion 14.02.5004.000">\n<TITLE></TITLE>\n</HEAD>\n<BODY>\n<!-- Converted
+ from text/rtf format -->\n\n<P DIR=LTR><SPAN LANG="de"><FONT FACE="Calibri
+ ">Dear ERMI team\,</FONT></SPAN></P>\n\n<P DIR=LTR><SPAN LANG="de"><FONT F
+ ACE="Calibri">please find the invitation to our next project call below. I
+  setup a meeting using Webex\, which should give us a better experience th
+ an in the last call. You can join the meeting using the link below.</FONT>
+ </SPAN></P>\n\n<P DIR=LTR><SPAN LANG="de"><FONT FACE="Calibri">Thanks and
+ best regards\,</FONT></SPAN></P>\n\n<P DIR=LTR><SPAN LANG="de"><FONT FACE=
+ "Calibri">Ferdinand</FONT></SPAN></P>\n<BR>\n\n<P DIR=LTR><SPAN LANG="de">
+ <FONT FACE="Calibri">ERMI Project Call</FONT></SPAN></P>\n\n<P DIR=LTR><SP
+ AN LANG="de"><FONT FACE="Calibri">Ausgerichtet von Ferdinand Pieper</FONT>
+ </SPAN></P>\n\n<P DIR=LTR><SPAN LANG="de"><FONT FACE="Calibri">Dienstag\,
+ 26 Mai\, 2020 14:00 | 2 Stunden | (UTC+02:00) Amsterdam\, Berlin\, Bern\,
+ Rom\, Stockholm\, Wien</FONT></SPAN></P>\n\n<P DIR=LTR><SPAN LANG="de"><FO
+ NT FACE="Calibri">Meeting-Kennnummer: 236 070 401</FONT></SPAN></P>\n\n<P
+ DIR=LTR><SPAN LANG="de"><FONT FACE="Calibri">Passwort: 7VkfK2GmWr3</FONT><
+ /SPAN></P>\n\n<P DIR=LTR><SPAN LANG="de"></SPAN><A HREF="https://luis-uni-
+ hannover.webex.com/luis-uni-hannover/j.php?MTID=m9612d281a58442d10e18e721f
+ 199180a"><SPAN LANG="de"><U><FONT COLOR="#0000FF" FACE="Calibri">https://l
+ uis-uni-hannover.webex.com/luis-uni-hannover/j.php?MTID=m9612d281a58442d10
+ e18e721f199180a</FONT></U></SPAN><SPAN LANG="de"></SPAN></A><SPAN LANG="de
+ "></SPAN></P>\n\n<P DIR=LTR><SPAN LANG="de"><FONT FACE="Calibri">Über Vid
+ eosystem beitreten</FONT></SPAN></P>\n\n<P DIR=LTR><SPAN LANG="de"><FONT F
+ ACE="Calibri">Wählen Sie</FONT></SPAN><SPAN LANG="de"> </SPAN><A HREF="ma
+ ilto:236070401@luis-uni-hannover.webex.com"><SPAN LANG="de"><U><FONT COLOR
+ ="#0000FF" FACE="Calibri">236070401@luis-uni-hannover.webex.com</FONT></U>
+ </SPAN><SPAN LANG="de"></SPAN></A><SPAN LANG="de"></SPAN></P>\n\n<P DIR=LT
+ R><SPAN LANG="de"><FONT FACE="Calibri">Sie können auch 62.109.219.4 wähl
+ en und Ihre Meeting-Nummer eingeben.</FONT></SPAN></P>\n\n<P DIR=LTR><SPAN
+  LANG="de"><FONT FACE="Calibri">Über Telefon beitreten</FONT></SPAN></P>\
+ n\n<P DIR=LTR><SPAN LANG="de"><FONT FACE="Calibri">+49-619-6781-9736 Germa
+ ny Toll</FONT></SPAN></P>\n\n<P DIR=LTR><SPAN LANG="de"><FONT FACE="Calibr
+ i">+49-69-2551-14400 Germany Toll 2</FONT></SPAN></P>\n\n<P DIR=LTR><SPAN
+ LANG="de"><FONT FACE="Calibri">Zugriffscode: 236 070 401</FONT></SPAN><SPA
+ N LANG="de"></SPAN></P>\n\n<P DIR=LTR><SPAN LANG="de"></SPAN></P>\n\n<P DI
+ R=LTR><SPAN LANG="de"></SPAN></P>\n\n<P DIR=LTR><SPAN LANG="de"></SPAN><SP
+ AN LANG="de-de"><FONT FACE="Calibri">--</FONT></SPAN></P>\n\n<P DIR=LTR><S
+ PAN LANG="de-de"><FONT FACE="Calibri">M.Sc. Ferdinand Pieper</FONT></SPAN>
+ </P>\n\n<P DIR=LTR><SPAN LANG="de-de"><FONT FACE="Calibri">Institut für M
+ ikroelektronische Systeme</FONT></SPAN></P>\n\n<P DIR=LTR><SPAN LANG="de-d
+ e"><FONT FACE="Calibri">Fachgebiet Entwurf integrierter Mixed-Signal-Schal
+ tungen</FONT></SPAN></P>\n\n<P DIR=LTR><SPAN LANG="de-de"><FONT FACE="Cali
+ bri">Leibniz Universität Hannover -</FONT></SPAN><SPAN LANG="de"> </SPAN>
+ <A HREF="https://www.ims.uni-hannover.de/"><SPAN LANG="de"><U></U></SPAN><
+ U><SPAN LANG="de-de"><FONT COLOR="#0000FF" FACE="Calibri">https://www.ims.
+ uni-hannover.de</FONT></SPAN></U><SPAN LANG="de"></SPAN></A><SPAN LANG="de
+ "></SPAN><SPAN LANG="de-de"></SPAN></P>\n\n<P DIR=LTR><SPAN LANG="de"></SP
+ AN><SPAN LANG="de-de"></SPAN></P>\n\n<P DIR=LTR><SPAN LANG="de"></SPAN></P
+ >\n\n<P DIR=LTR><SPAN LANG="de"></SPAN></P>\n\n</BODY>\n</HTML>
+X-MICROSOFT-CDO-BUSYSTATUS:TENTATIVE
+X-MICROSOFT-CDO-IMPORTANCE:1
+X-MICROSOFT-CDO-INTENDEDSTATUS:BUSY
+X-MICROSOFT-DISALLOW-COUNTER:FALSE
+X-MS-OLK-AUTOSTARTCHECK:FALSE
+X-MS-OLK-CONFTYPE:0
+END:VEVENT
+END:VCALENDAR
+#+end_src
+*** VEVENT
+**** Spec
+| Parameters    | Notes         | often implemented | Outlook | required-p                      |
+|---------------+---------------+-------------------+---------+---------------------------------|
+| DTSTAMP       |               | X                 |         | required                        |
+| UID           |               | X                 |         | required                        |
+| DTSTART       |               | X                 |         | required if no METHOD specified |
+| CLASS         |               | (X)               |         | optional                        |
+| CREATED       |               |                   | X       | optional                        |
+| DESCRIPTION   |               | X                 |         | optional                        |
+| GEO           |               |                   |         | optional                        |
+| LAST-MOD      |               |                   |         | optional                        |
+| LOCATION      |               | X                 |         | optional                        |
+| ORGANIZER     |               | X                 |         | optional                        |
+| PRIORITY      |               | (X)               |         | optional                        |
+| SEQ           |               |                   |         | optional                        |
+| STATUS        |               |                   |         | optional                        |
+| SUMMARY       |               | X                 |         | optional                        |
+| TRANSP        |               |                   |         | optional                        |
+| URL           |               |                   |         | optional                        |
+| RECURID       |               |                   |         | optional                        |
+| RRULE         | repeat rules? |                   |         | optional                        |
+| DTEND         |               | X                 |         | or DURATION in same eventprop   |
+| DURATION      |               | (X)               |         | or DTEND in same eventprop      |
+| attach        |               | (X)               |         | optional, multiple ok           |
+| attendee      |               | X                 |         | optional, multiple ok           |
+| categories    |               |                   |         | optional, multiple ok           |
+| comment       |               |                   |         | optional, multiple ok           |
+| contact       |               |                   |         | optional, multiple ok           |
+| exdate        |               |                   |         | optional, multiple ok           |
+| rstatus       |               |                   |         | optional, multiple ok           |
+| related       |               |                   |         | optional, multiple ok           |
+| resources     |               |                   |         | optional, multiple ok           |
+| rdate         |               |                   |         | optional, multiple ok           |
+| x-prop        |               |                   |         | optional, multiple ok           |
+| iana-prop     |               |                   |         | optional, multiple ok           |
+
+- Can include VALARM components.
+- Transparency set to =TRANSPARENT= to not block the event time for
+  other events.
+- whole-day events have a date for =DTSTART= instead of date-time. If
+  it also has a =DTEND= it must also be a date, if it has a =DURATION=
+  it muste be "dur-day" or "dur-week"
+- =DTSTART= is inclusive. For recurring events it is also the first instance.
+- =DTEND= is non-inclusive.
+- If a whole-day event but no DTEND or DURATION, the duration is
+  assumed to be one day.
+- If =DTSTART= is a date-time and no end or duration the event ends on
+  the same date-time as =DTSTART=
+- =VEVENT= can not be nested, but related to each other with =VTODO=
+  or =VJOURNAL= with the =RELATED-TO= property.
+- =CLASS:PRIVATE= events will be opaque to searches for busy time.
+  =CLASS:PUBLIC= + =TRANSP:TRANSPARENT= events will be transparent.?
+***** Sub-properties
+- DTSTAMP :: =DATE-TIME= of Creation for Objects with METHOD property, of last revision for objects without METHOD
+- UID :: =TEXT= Globally unique identifier
+- DTSTART :: =DATE-TIME= or =DATE= Begin of calendar component: ~DTSTART:19980118T073000Z~
+- CLASS :: =TEXT= defines access classification ("PUBLIC", "PRIVATE", "CONFIDENTIAL"). =x-name= and =iana-token= values must be treated the same as "PRIVATE". Default is "PUBLIC".
+- CREATED ::
+- DESCRIPTION :: =TEXT= lenghty description
+- GEO ::
+- LAST-MOD ::
+- LOCATION ::
+- ORGANIZER ::
+- PRIORITY ::
+- SEQ ::
+- STATUS ::
+- SUMMARY :: =TEXT= one-line summary
+- TRANSP ::
+- URL ::
+- RECURID ::
+- RRULE ::
+- DTEND ::
+- DURATION :: =DURATION=
+- ATTACH ::
+- ATTENDEE ::
+- CATEGORIES ::
+- COMMENT ::
+- CONTACT ::
+- EXDATE ::
+- RSTATUS ::
+- RELATED ::
+- RESOURCES ::
+- RDATE ::
+- X-PROP ::
+- IANA-PROP ::
+**** Elisp implementation
+:PROPERTIES:
+:header-args:emacs-lisp: :tangle gnus-icalendar-request.el
+:END:
+#+begin_src emacs-lisp
+(defun format-required-attendee (attendee)
+  (format "ATTENDEE;PARTSTAT=NEEDS-ACTION;ROLE=REQ-PARTICIPANT;RSVP=TRUE:mailto:%s" attendee))
+(defun format-optional-attendee (attendee)
+  (format "ATTENDEE;PARTSTAT=NEEDS-ACTION;ROLE=OPT-PARTICIPANT;RSVP=TRUE:mailto:%s" attendee))
+
+(defun create-attendee-list (req opt)
+  (concat
+   (mapconcat 'format-required-attendee req "\n")
+   (when opt "\n")
+   (mapconcat 'format-optional-attendee opt "\n")))
+
+(defun ical-event-to-ical (event)
+  (with-slots (summary description location organizer recur uid start-time end-time req-participants opt-participants) event
+    (let ((dtstamp (format-time-string "DTSTAMP:%Y%m%dT%H%M%SZ" nil t)) ;; current UTC time
+          (summary (format "SUMMARY:%s" summary))
+          (description (format "DESCRIPTION:%s" description))
+          (dtstart (format-time-string "DTSTART:%Y%m%dT%H%M%SZ" start-time t)) ;; start-time in UTC
+          (dtend (format-time-string "DTEND:%Y%m%dT%H%M%SZ" end-time t)) ;; end-time in UTC
+          (attendee (create-attendee-list req-participants opt-participants))
+          (location (format "LOCATION:%s" location))
+          (organizer (format "ORGANIZER:%s" organizer))
+          (uid (format "UID:%s" uid))
+          (sequence "SEQUENCE:0") ;; TODO: Consider follow-up event modifications.
+          ;; TODO: handle recur
+          )
+      (mapconcat #'identity (list "BEGIN:VEVENT"
+                                  dtstamp
+                                  dtstart
+                                  dtend
+                                  summary
+                                  description
+                                  attendee
+                                  location
+                                  organizer
+                                  uid
+                                  sequence
+                                  "END:VEVENT") "\n"))
+    ))
+#+end_src
+Vcalendar boiler plate
+#+begin_src emacs-lisp
+(defvar gnus-icalendar-vtimezone-times
+  '(CEST "BEGIN:DAYLIGHT
+TZOFFSETFROM:+0100
+TZOFFSETTO:+0200
+TZNAME:CEST
+DTSTART:19700329T020000
+RRULE:FREQ=YEARLY;BYDAY=-1SU;BYMONTH=3
+END:DAYLIGHT
+BEGIN:STANDARD
+TZOFFSETFROM:+0200
+TZOFFSETTO:+0100
+TZNAME:CET
+DTSTART:19701025T030000
+RRULE:FREQ=YEARLY;BYDAY=-1SU;BYMONTH=10
+END:STANDARD"
+        CET "BEGIN:DAYLIGHT
+TZOFFSETFROM:+0100
+TZOFFSETTO:+0200
+TZNAME:CEST
+DTSTART:19700329T020000
+RRULE:FREQ=YEARLY;BYDAY=-1SU;BYMONTH=3
+END:DAYLIGHT
+BEGIN:STANDARD
+TZOFFSETFROM:+0200
+TZOFFSETTO:+0100
+TZNAME:CET
+DTSTART:19701025T030000
+RRULE:FREQ=YEARLY;BYDAY=-1SU;BYMONTH=10
+END:STANDARD")
+  "Timezone information about standard and daylight savings time used in VCALENDAR parts.")
+(defun gnus-icalendar--default-vtimezone (&optional zone)
+  "Return default VTIMEZONE information for the current time zone or ZONE if provided."
+  (let ((time-zone (current-time-zone nil zone)))
+    (format "BEGIN:STANDARD
+DTSTART:%s
+TZOFFSETTO:%s
+TZOFFSETFROM:+0000
+TZNAME:%s
+END:STANDARD"
+            (format-time-string "%Y%m%dT%H%M%S" 0) ;; set effective timezone start date to epoch
+            (format-time-string "%z" (current-time) time-zone) ;; time zone offset
+            (cadr time-zone)
+            )))
+#+end_src
+#+begin_src emacs-lisp
+(defun gnus-icalendar-vcalendar (event)
+  "Create VCALENDAR part with VEVENT part EVENT."
+  (let* ((time-zone (cadr (current-time-zone)))
+         (vtimezone (mapconcat #'identity `("BEGIN:VTIMEZONE"
+                                            ,(format "TZID:%s" time-zone)
+                                            ,(or (plist-get gnus-icalendar-vtimezone-times (intern time-zone))
+                                                 (gnus-icalendar-default-vtimezone))
+                                            "END:VTIMEZONE") "\n")))
+    (mapconcat #'identity `("BEGIN:VCALENDAR"
+                            "PRODID:Gnus"
+                            "VERSION:2.0"
+                            "METHOD:REQUEST"
+                            ,vtimezone
+                            ,event
+                            "END:VCALENDAR") "\n")))
+#+end_src
+Insert =text/calendar= part in message
+#+begin_src emacs-lisp
+(defun gnus-icalendar-message-insert-request (event)
+  "Insert text/calendar part into message with request for VEVENT
+  specified in EVENT."
+  (when (eq major-mode 'message-mode)
+    (mml-insert-part "text/calendar; method=\"REQUEST\"; charset=UTF-8")
+    (insert (gnus-icalendar-vcalendar (ical-event-to-ical event)))))
+#+end_src
+***** Create event
+#+begin_src emacs-lisp
+(defun gnus-icalendar-event-from-message (&optional date-range location)
+  "Create a event request based on the current message.
+
+Direct recipients of the message (in To header) are interpreted
+as required participants. Recipients in Cc are optional
+participants. The From header is always converted to the event
+organizer. Message subject is interpreted as summary and message
+body (if existant) as description. Time and date of the event can
+be provided as org formatted date range (only with time for now)
+or will be asked for if nil. Same for location."
+  (interactive)
+  (if (not message-draft-article) ;; internally set by message-mode
+      (message "Not in a message draft")
+    (unless (or date (featurep 'org))
+      (error "Timestamp creation requires org. Please load org or provide a org-styled date range"))
+    (message-check-recipients) ;; check for bogus recipients
+    (let* ((date (or date
+                     (with-temp-buffer
+                       (org-time-stamp nil)
+                       (buffer-string))))
+           (start-time (org-timestamp-to-time
+                        (org-timestamp-from-string date) nil))
+           (end-time (org-timestamp-to-time ;; set end-time if input was a time-range
+                      (org-timestamp-from-string date) t))
+           (end-time (if (equal end-time start-time) ;; ask for end-time if previous input was not a range
+                         (org-read-date nil t nil "End time:" start-time)
+                       end-time))
+           ;; TODO: better differentiate date-time ranges and date (whole-day) ranges
+           (uid (if (featurep 'org-id)
+                    (org-id-uuid)
+                  (format "%s@%s"
+                          (number-to-string (abs (random)))
+                          (md5 (format "%s%s%s%s"
+                                       (emacs-pid)
+                                       user-full-name
+                                       user-mail-address
+                                       (system-name))))))
+           (recur nil) ;; TODO
+           (location (or location (read-string "Event location: ")))
+           (description (when (message-goto-body)
+                          (buffer-substring (point) (point-max))))
+           (summary (save-restriction
+                      (message-narrow-to-headers)
+                      (message-fetch-field "Subject")))
+           (organizer (save-restriction
+                        (message-narrow-to-headers)
+                        (message-fetch-field "From"))) ;; TODO handle "name <mail@address.net>"
+           (rsvp nil) ;; TODO
+           (participation-type 'non-participant) ;; TODO
+           (req-participants (mapcar #'car
+                                     (mail-header-parse-addresses
+                                      (save-restriction
+                                        (message-narrow-to-headers)
+                                        (message-fetch-field "To")))))
+           (opt-participants (mapcar #'car
+                                     (mail-header-parse-addresses
+                                      (save-restriction
+                                        (message-narrow-to-headers)
+                                        (message-fetch-field "Cc")))))
+           (event (gnus-icalendar-event-request :uid uid
+                                                :recur recur
+                                                :location location
+                                                :description description
+                                                :summary summary
+                                                :method "REQUEST"
+                                                :organizer organizer
+                                                :start-time start-time
+                                                :end-time end-time
+                                                :rsvp rsvp
+                                                :participation-type participation-type
+                                                :req-participants req-participants
+                                                :opt-participants opt-participants)))
+      (message-goto-body)
+      (delete-region (point) (point-max))
+      (mml-insert-multipart "mixed")
+      (mml-insert-part "text/plain")
+      (insert description "\n")
+      (re-search-forward "<#/part>\n")
+      (gnus-icalendar-message-insert-request event))))
+#+end_src
+**** test
+#+begin_src emacs-lisp
+(setq testevent (gnus-icalendar-event :uid "7605a92a-5bfc-4b46-9e8c-93c41014de7e" :recur nil :location "webex" :description "testbeschreibung" :summary "New Event" :method "REQUEST" :organizer "ferdinand.pieper@ims.uni-hannover.de" :start-time '(24255 65520) :end-time '(24256 3584) :rsvp nil :participation-type 'non-participant :req-participants '("fpi_314@gmx.de") :opt-participants nil))
+;; #s(gnus-icalendar-event "ferdinand.pieper@ims.uni-hannover.de" "New Event" "testbeschreibung" "webex" (24255 65520) (24256 3584) nil "7605a92a-5bfc-4b46-9e8c-93c41014de7e" "REQUEST" nil non-participant ("fpi_314@gmx.de") nil)
+
+(setq testevent (gnus-icalendar-event :uid "7605a92a-5bfc-4b46-def-93c41014de7e" :recur nil :location "testplatz" :description "testbeschreibung" :summary "Pizza" :method "REQUEST" :organizer "fpi_314@gmx.de" :start-time '(24255 65520) :end-time '(24256 3584) :rsvp nil :participation-type 'non-participant :req-participants '("fer@pie.tf" "ferdinand.pieper@ims.uni-hannover.de") :opt-participants nil))
+(setq testevent (gnus-icalendar-event :uid "7605a92a-5bfc-4b46-def-93d41014de7e" :recur nil :location "ATF8" :description "description" :summary "testevent" :method "REQUEST" :organizer "fer@pie.tf" :start-time (encode-time 0 0 10 18 5 2020) :end-time (encode-time 0 0 11 18 5 2020) :rsvp nil :participation-type 'opt-participant :req-participants '("fpi_314@gmx.net" "ferdinand.pieper@ims.uni-hannover.de") :opt-participants nil))
+(let ((event (ical-event-to-ical testevent)))
+  (gnus-icalendar-vcalendar event)
+  )
+;; (gnus-icalendar-message-insert-request testevent)
+#+end_src
+
+#+RESULTS:
+#+begin_example
+BEGIN:VCALENDAR
+PRODID:Gnus
+VERSION:2.0
+METHOD:REQUEST
+BEGIN:VTIMEZONE
+TZID:CEST
+BEGIN:DAYLIGHT
+TZOFFSETFROM:+0100
+TZOFFSETTO:+0200
+TZNAME:CEST
+DTSTART:19700329T020000
+RRULE:FREQ=YEARLY;BYDAY=-1SU;BYMONTH=3
+END:DAYLIGHT
+BEGIN:STANDARD
+TZOFFSETFROM:+0200
+TZOFFSETTO:+0100
+TZNAME:CET
+DTSTART:19701025T030000
+RRULE:FREQ=YEARLY;BYDAY=-1SU;BYMONTH=10
+END:STANDARD
+END:VTIMEZONE
+BEGIN:VEVENT
+DTSTAMP:20200517T142412Z
+DTSTART:20200516T150000Z
+DTEND:20200516T160000Z
+SUMMARY:Pizza
+DESCRIPTION:testbeschreibung
+ATTENDEE;PARTSTAT=NEEDS-ACTION;ROLE=REQ-PARTICIPANT;RSVP=TRUE:mailto:fer@pie.tf
+ATTENDEE;PARTSTAT=NEEDS-ACTION;ROLE=REQ-PARTICIPANT;RSVP=TRUE:mailto:ferdinand.pieper@ims.uni-hannover.de
+LOCATION:testplatz
+ORGANIZER:fpi_314@gmx.de
+UID:7605a92a-5bfc-4b46-def-93c41014de7e
+SEQUENCE:0
+END:VEVENT
+END:VCALENDAR
+#+end_example
