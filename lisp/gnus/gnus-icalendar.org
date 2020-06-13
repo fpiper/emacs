@@ -1724,47 +1724,64 @@ END:VCALENDAR
 :header-args:emacs-lisp: :tangle gnus-icalendar-request.el
 :END:
 #+begin_src emacs-lisp
-(defun format-required-attendee (attendee)
-  (format "ATTENDEE;PARTSTAT=NEEDS-ACTION;ROLE=REQ-PARTICIPANT;RSVP=TRUE:mailto:%s" attendee))
-(defun format-optional-attendee (attendee)
-  (format "ATTENDEE;PARTSTAT=NEEDS-ACTION;ROLE=OPT-PARTICIPANT;RSVP=TRUE:mailto:%s" attendee))
+(defun gnus-icalendar-event--format-attendee (attendee role)
+  (when (member role '("req" "opt"))
+    (format "ATTENDEE;PARTSTAT=NEEDS-ACTION;ROLE=%s-PARTICIPANT;RSVP=TRUE:mailto:%s" (upcase role) attendee)))
 
-(defun create-attendee-list (req opt)
+(defun gnus-icalendar-event--create-attendee-list (req opt)
   (concat
-   (mapconcat 'format-required-attendee req "\n")
-   (when opt "\n")
-   (mapconcat 'format-optional-attendee opt "\n")))
+   (mapconcat (lambda (req) (gnus-icalendar-event--format-attendee req "req")) req "\n")
+   (when opt
+     "\n"
+     (mapconcat (lambda (opt) (gnus-icalendar-event--format-attendee opt "opt")) opt "\n"))))
 
-(defun ical-event-to-ical (event)
+(defun gnus-icalendar-event--ical-from-event (event)
   (with-slots (summary description location organizer recur uid start-time end-time req-participants opt-participants) event
     (let ((dtstamp (format-time-string "DTSTAMP:%Y%m%dT%H%M%SZ" nil t)) ;; current UTC time
           (summary (format "SUMMARY:%s" summary))
-          (description (format "DESCRIPTION:%s" description))
+          (description (when (and (stringp description) (not (string-empty-p description)))
+                         (format "DESCRIPTION:%s"
+                                 (with-temp-buffer
+                                   (insert description)
+                                   (beginning-of-buffer)
+                                   (while (re-search-forward "\n" nil t)
+                                     (replace-match "\\n" t t))
+                                   (buffer-string))))) ;; TODO: How to do this properly?
           (dtstart (format-time-string "DTSTART:%Y%m%dT%H%M%SZ" start-time t)) ;; start-time in UTC
           (dtend (format-time-string "DTEND:%Y%m%dT%H%M%SZ" end-time t)) ;; end-time in UTC
-          (attendee (create-attendee-list req-participants opt-participants))
-          (location (format "LOCATION:%s" location))
-          (organizer (format "ORGANIZER:%s" organizer))
+          (attendee (gnus-icalendar-event--create-attendee-list req-participants opt-participants))
+          (location (when (and (stringp location) (not (string-empty-p location)))
+                      (format "LOCATION:%s" location)))
+          (organizer (format "ORGANIZER:mailto:%s" organizer))
           (uid (format "UID:%s" uid))
           (sequence "SEQUENCE:0") ;; TODO: Consider follow-up event modifications.
           ;; TODO: handle recur
           )
-      (mapconcat #'identity (list "BEGIN:VEVENT"
-                                  dtstamp
-                                  dtstart
-                                  dtend
-                                  summary
-                                  description
-                                  attendee
-                                  location
-                                  organizer
-                                  uid
-                                  sequence
-                                  "END:VEVENT") "\n"))
-    ))
+      (with-temp-buffer
+        (insert
+         (mapconcat #'identity
+                    (list "BEGIN:VEVENT"
+                          dtstamp
+                          dtstart
+                          dtend
+                          summary
+                          description
+                          attendee
+                          location
+                          organizer
+                          uid
+                          sequence
+                          "END:VEVENT") "\n"))
+        (flush-lines "^$" (point-min) (point-max))
+        (buffer-string)))))
 #+end_src
 Vcalendar boiler plate
 #+begin_src emacs-lisp
+;; Vcalendar creation
+
+;; I have not yet found a good way to create vtimezone accurately from
+;; scratch. For now hardcoded for CET/CEST and crude general
+;; implementation below.
 (defvar gnus-icalendar-vtimezone-times
   '(CEST "BEGIN:DAYLIGHT
 TZOFFSETFROM:+0100
@@ -1795,6 +1812,7 @@ DTSTART:19701025T030000
 RRULE:FREQ=YEARLY;BYDAY=-1SU;BYMONTH=10
 END:STANDARD")
   "Timezone information about standard and daylight savings time used in VCALENDAR parts.")
+
 (defun gnus-icalendar--default-vtimezone (&optional zone)
   "Return default VTIMEZONE information for the current time zone or ZONE if provided."
   (let ((time-zone (current-time-zone nil zone)))
@@ -1810,13 +1828,13 @@ END:STANDARD"
             )))
 #+end_src
 #+begin_src emacs-lisp
-(defun gnus-icalendar-vcalendar (event)
+(defun gnus-icalendar--build-vcalendar-from-vevent (event)
   "Create VCALENDAR part with VEVENT part EVENT."
   (let* ((time-zone (cadr (current-time-zone)))
          (vtimezone (mapconcat #'identity `("BEGIN:VTIMEZONE"
                                             ,(format "TZID:%s" time-zone)
                                             ,(or (plist-get gnus-icalendar-vtimezone-times (intern time-zone))
-                                                 (gnus-icalendar-default-vtimezone))
+                                                 (gnus-icalendar--default-vtimezone))
                                             "END:VTIMEZONE") "\n")))
     (mapconcat #'identity `("BEGIN:VCALENDAR"
                             "PRODID:Gnus"
@@ -1828,16 +1846,17 @@ END:STANDARD"
 #+end_src
 Insert =text/calendar= part in message
 #+begin_src emacs-lisp
-(defun gnus-icalendar-message-insert-request (event)
+(defun gnus-icalendar-event-message-insert-request (event)
   "Insert text/calendar part into message with request for VEVENT
   specified in EVENT."
-  (when (eq major-mode 'message-mode)
+  (when (provided-mode-derived-p major-mode 'message-mode)
     (mml-insert-part "text/calendar; method=\"REQUEST\"; charset=UTF-8")
-    (insert (gnus-icalendar-vcalendar (ical-event-to-ical event)))))
+    (insert (gnus-icalendar--build-vcalendar-from-vevent
+             (gnus-icalendar-event--ical-from-event event)))))
 #+end_src
 ***** Create event
 #+begin_src emacs-lisp
-(defun gnus-icalendar-event-from-message (&optional date-range location)
+(defun gnus-icalendar-event-from-message-and-insert (&optional date location)
   "Create a event request based on the current message.
 
 Direct recipients of the message (in To header) are interpreted
@@ -1881,9 +1900,10 @@ or will be asked for if nil. Same for location."
            (summary (save-restriction
                       (message-narrow-to-headers)
                       (message-fetch-field "Subject")))
-           (organizer (save-restriction
-                        (message-narrow-to-headers)
-                        (message-fetch-field "From"))) ;; TODO handle "name <mail@address.net>"
+           (organizer (caar (mail-header-parse-addresses
+                            (save-restriction
+                              (message-narrow-to-headers)
+                              (message-fetch-field "From"))))) ;; TODO insert common name for "name <mail@address.net>" addresses
            (rsvp nil) ;; TODO
            (participation-type 'non-participant) ;; TODO
            (req-participants (mapcar #'car
@@ -1911,11 +1931,12 @@ or will be asked for if nil. Same for location."
                                                 :opt-participants opt-participants)))
       (message-goto-body)
       (delete-region (point) (point-max))
-      (mml-insert-multipart "mixed")
-      (mml-insert-part "text/plain")
-      (insert description "\n")
-      (re-search-forward "<#/part>\n")
-      (gnus-icalendar-message-insert-request event))))
+      (when (not (string-empty-p description))
+        (mml-insert-multipart "mixed")
+        (mml-insert-part "text/plain")
+        (insert description "\n")
+        (re-search-forward "<#/part>\n"))
+      (gnus-icalendar-event-message-insert-request event))))
 #+end_src
 **** test
 #+begin_src emacs-lisp
