@@ -278,7 +278,10 @@ status will be retrieved from the first matching attendee record."
      "\n"
      (mapconcat (lambda (opt) (gnus-icalendar-event--format-attendee opt "opt")) opt "\n"))))
 
-(defun gnus-icalendar-event--ical-from-event (event)
+(defun gnus-icalendar-event--ical-vevent-from-event (event)
+  "Create a VEVENT block from EVENT.
+
+EVENT is a `gnus-icalendar-event-request' object."
   (with-slots (summary description location organizer recur uid start-time end-time req-participants opt-participants) event
     (let ((dtstamp (format-time-string "DTSTAMP:%Y%m%dT%H%M%SZ" nil t)) ;; current UTC time
           (summary (format "SUMMARY:%s" summary))
@@ -315,15 +318,15 @@ status will be retrieved from the first matching attendee record."
                           uid
                           sequence
                           "END:VEVENT") "\n"))
-        (flush-lines "^$" (point-min) (point-max))
+        (flush-lines "^$" (point-min) (point-max)) ;; remove empty lines
         (buffer-string)))))
 
-;; Vcalendar creation
+;; VCALENDAR creation
 
 ;; I have not yet found a good way to create vtimezone accurately from
 ;; scratch. For now hardcoded for CET/CEST and crude general
 ;; implementation below.
-(defvar gnus-icalendar-vtimezone-times
+(defcustom gnus-icalendar-vtimezone-times
   '(CEST "BEGIN:DAYLIGHT
 TZOFFSETFROM:+0100
 TZOFFSETTO:+0200
@@ -352,10 +355,24 @@ TZNAME:CET
 DTSTART:19701025T030000
 RRULE:FREQ=YEARLY;BYDAY=-1SU;BYMONTH=10
 END:STANDARD")
-  "Timezone information about standard and daylight savings time used in VCALENDAR parts.")
+  "VTIMEZONE part to use for a given timezone.
+
+This should include information about daylight savings time. The
+property key should be a timezone name as returned by
+`current-time-zone'. The value a string which will be inserted
+inbetween \":BEGIN:VTIMEZONE:\" and \":END:VTIMEZONE:\".
+
+Although the content for daylight savings time and non daylight
+savings time variations of your timezone are identical they need
+to be included twice in this plist, once for each timezone
+variation."
+  :type '(plist :value-type string)
+  :group 'gnus-icalendar)
 
 (defun gnus-icalendar--default-vtimezone (&optional zone)
-  "Return default VTIMEZONE information for the current time zone or ZONE if provided."
+  "Return VTIMEZONE information for current time zone or ZONE.
+
+This does not take daylight savings time into account."
   (let ((time-zone (current-time-zone nil zone)))
     (format "BEGIN:STANDARD
 DTSTART:%s
@@ -364,12 +381,17 @@ TZOFFSETFROM:+0000
 TZNAME:%s
 END:STANDARD"
             (format-time-string "%Y%m%dT%H%M%S" 0) ;; set effective timezone start date to epoch
-            (format-time-string "%z" (current-time) time-zone) ;; time zone offset
+            (format-time-string "%z" nil time-zone) ;; time zone offset
             (cadr time-zone)
             )))
 
 (defun gnus-icalendar--build-vcalendar-from-vevent (event)
-  "Create VCALENDAR part with VEVENT part EVENT."
+  "Create VCALENDAR part with VEVENT part EVENT.
+
+Timezone information is taken from
+`gnus-icalendar-vtimezone-times' or generated with
+`gnus-icalendar--default-vtimezone' if no information is found
+for the current time zone."
   (let* ((time-zone (cadr (current-time-zone)))
          (vtimezone (mapconcat #'identity `("BEGIN:VTIMEZONE"
                                             ,(format "TZID:%s" time-zone)
@@ -385,15 +407,17 @@ END:STANDARD"
                             "END:VCALENDAR") "\n")))
 
 (defun gnus-icalendar-event-message-insert-request (event)
-  "Insert text/calendar part into message with request for VEVENT
-  specified in EVENT."
+  "Insert icalendar request as text/calendar part.
+
+EVENT is a `gnus-icalendar-event-request' object and specifies
+the event information."
   (when (provided-mode-derived-p major-mode 'message-mode)
     (mml-insert-part "text/calendar; method=\"REQUEST\"; charset=UTF-8")
     (insert (gnus-icalendar--build-vcalendar-from-vevent
-             (gnus-icalendar-event--ical-from-event event)))))
+             (gnus-icalendar-event--ical-vevent-from-event event)))))
 
 (defun gnus-icalendar-event-request-from-message-and-insert (&optional date location)
-  "Create a event request based on the current message.
+  "Create an ical event request based on the current message draft.
 
 Direct recipients of the message (in To header) are interpreted
 as required participants. Recipients in Cc are optional
