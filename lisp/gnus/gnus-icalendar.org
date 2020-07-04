@@ -1204,11 +1204,11 @@ Function is similar to ~gnus-icalendar-event-reply-from-buffer~.
 (gnus-icalendar-event--build-reply-event-body event 'tentative '("ferdinand\\.pieper@ims\\.uni-hannover\\.de" "ferdinand\\.pieper@ims\\.uni-hannover\\.de"))
 #+end_src
 
-** Icalendar RFC5545 spec
-*** Example VCALENDAR
-**** Meeting Invites & Replys
-***** Summary
-****** VEVENT
+* Icalendar RFC5545 spec
+** Example VCALENDAR
+*** Meeting Invites & Replys
+**** Summary
+***** VEVENT
 | Properties                     | gnus-icalendar | Thunderbird | Evolution   | 1&1 Mail |
 |--------------------------------+----------------+-------------+-------------+----------|
 | dtstamp                        |                | x           | x           | x        |
@@ -1236,7 +1236,7 @@ Function is similar to ~gnus-icalendar-event-reply-from-buffer~.
 | X-MS-OLK-CONFTYPE              |                | x           | x           |          |
 | X-MICROSOFT-CDO-REPLYTIME      |                |             | x           |          |
 | RRULE                          | x              | ?           | ?           | ?        |
-***** Gmx.net invite
+**** Gmx.net invite
 #+begin_src fundamental
 BEGIN:VCALENDAR
 PRODID:-//1&1 Mail & Media GmbH/WEB.DE Kalender Server
@@ -1418,7 +1418,7 @@ END:STANDARD
 END:VTIMEZONE
 END:VCALENDAR
 #+end_src
-***** sogo reply to outlook
+**** sogo reply to outlook
 #+begin_src fundamental
 BEGIN:VCALENDAR
 PRODID:-//Ximian//NONSGML Evolution Calendar//EN
@@ -1515,7 +1515,7 @@ eper@i
 END:VEVENT
 END:VCALENDAR
 #+end_src
-***** reply to outlook invite
+**** reply to outlook invite
 #+begin_src fundamental
 BEGIN:VCALENDAR
 PRODID:-//Mozilla.org/NONSGML Mozilla Calendar V1.1//EN
@@ -1633,8 +1633,8 @@ X-MS-OLK-CONFTYPE:0
 END:VEVENT
 END:VCALENDAR
 #+end_src
-*** VEVENT
-**** Spec
+** VEVENT
+*** Spec
 | Parameters    | Notes         | often implemented | Outlook | required-p                      |
 |---------------+---------------+-------------------+---------+---------------------------------|
 | DTSTAMP       |               | X                 |         | required                        |
@@ -1686,7 +1686,7 @@ END:VCALENDAR
   or =VJOURNAL= with the =RELATED-TO= property.
 - =CLASS:PRIVATE= events will be opaque to searches for busy time.
   =CLASS:PUBLIC= + =TRANSP:TRANSPARENT= events will be transparent.?
-***** Sub-properties
+**** Sub-properties
 - DTSTAMP :: =DATE-TIME= of Creation for Objects with METHOD property, of last revision for objects without METHOD
 - UID :: =TEXT= Globally unique identifier
 - DTSTART :: =DATE-TIME= or =DATE= Begin of calendar component: ~DTSTART:19980118T073000Z~
@@ -1719,7 +1719,7 @@ END:VCALENDAR
 - RDATE ::
 - X-PROP ::
 - IANA-PROP ::
-**** Elisp implementation
+*** Elisp implementation
 :PROPERTIES:
 :header-args:emacs-lisp: :tangle gnus-icalendar-request.el
 :END:
@@ -1854,7 +1854,7 @@ Insert =text/calendar= part in message
     (insert (gnus-icalendar--build-vcalendar-from-vevent
              (gnus-icalendar-event--ical-from-event event)))))
 #+end_src
-***** Create event
+**** Create event
 #+begin_src emacs-lisp
 (defun gnus-icalendar-event-from-message-and-insert (&optional date location)
   "Create a event request based on the current message.
@@ -1938,7 +1938,7 @@ or will be asked for if nil. Same for location."
         (re-search-forward "<#/part>\n"))
       (gnus-icalendar-event-message-insert-request event))))
 #+end_src
-**** test
+*** test
 #+begin_src emacs-lisp
 (setq testevent (gnus-icalendar-event :uid "7605a92a-5bfc-4b46-9e8c-93c41014de7e" :recur nil :location "webex" :description "testbeschreibung" :summary "New Event" :method "REQUEST" :organizer "ferdinand.pieper@ims.uni-hannover.de" :start-time '(24255 65520) :end-time '(24256 3584) :rsvp nil :participation-type 'non-participant :req-participants '("fpi_314@gmx.de") :opt-participants nil))
 ;; #s(gnus-icalendar-event "ferdinand.pieper@ims.uni-hannover.de" "New Event" "testbeschreibung" "webex" (24255 65520) (24256 3584) nil "7605a92a-5bfc-4b46-9e8c-93c41014de7e" "REQUEST" nil non-participant ("fpi_314@gmx.de") nil)
